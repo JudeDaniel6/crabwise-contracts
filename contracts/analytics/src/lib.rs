@@ -109,6 +109,9 @@ impl AnalyticsContract {
             .persistent()
             .get(&DataKey::EarningCount(artist.clone()))
             .unwrap_or(0u32);
+        // Checked increment (#43): a wrapped index would make the new record
+        // unreachable and let a later payout reuse a live key.
+        let next_idx = idx.checked_add(1).ok_or(AnalyticsError::ArithmeticOverflow)?;
 
         let record = EarningsRecord {
             artist: artist.clone(),
@@ -126,7 +129,7 @@ impl AnalyticsContract {
             .extend_ttl(&DataKey::Earning(artist.clone(), idx), ANALYTICS_TTL_LEDGERS, ANALYTICS_TTL_LEDGERS);
         env.storage()
             .persistent()
-            .set(&DataKey::EarningCount(artist.clone()), &(idx + 1));
+            .set(&DataKey::EarningCount(artist.clone()), &next_idx);
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::EarningCount(artist.clone()), ANALYTICS_TTL_LEDGERS, ANALYTICS_TTL_LEDGERS);
@@ -264,11 +267,20 @@ impl AnalyticsContract {
             .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
             .ok_or(AnalyticsError::NotFound)?;
 
-        let total = m.completed_count + m.cancelled_count;
+        // Checked arithmetic (#43): a wrapped sum would report a nonsensical
+        // completion rate instead of admitting the aggregate is unreadable.
+        let total = m
+            .completed_count
+            .checked_add(m.cancelled_count)
+            .ok_or(AnalyticsError::ArithmeticOverflow)?;
         if total == 0 {
             return Ok(0);
         }
-        Ok((m.completed_count * 100) / total)
+        let completed_percent = m
+            .completed_count
+            .checked_mul(100)
+            .ok_or(AnalyticsError::ArithmeticOverflow)?;
+        Ok(completed_percent / total)
     }
 
     /// Return the average response time in ledgers (rounded down).
