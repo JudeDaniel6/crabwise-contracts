@@ -242,27 +242,25 @@ impl AnalyticsContract {
 
     /// Return the full [`ArtistMetrics`] aggregate for an artist.
     ///
+    /// `NotFound` means the artist has no metrics record at all (#46); a
+    /// record whose fields disagree with each other is `InvalidMetricData`.
+    ///
     /// Closes #602 – read-back for all metric categories.
     pub fn get_metrics(env: Env, artist: Address) -> Result<ArtistMetrics, AnalyticsError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)
+        Self::load_metrics(&env, &artist)
     }
 
     /// Return the completion rate as a percentage (0–100).
     ///
     /// `completion_rate = completed / (completed + cancelled) * 100`
     ///
-    /// Returns 0 if no commissions have been recorded.
+    /// Returns 0 if the artist has a metrics record but no commissions have
+    /// been recorded — a real zero, distinct from `NotFound` for an artist
+    /// with no record at all (#46).
     ///
     /// Closes #602 – project completion rate tracking.
     pub fn get_completion_rate(env: Env, artist: Address) -> Result<u32, AnalyticsError> {
-        let m = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)?;
+        let m = Self::load_metrics(&env, &artist)?;
 
         let total = m.completed_count + m.cancelled_count;
         if total == 0 {
@@ -273,15 +271,13 @@ impl AnalyticsContract {
 
     /// Return the average response time in ledgers (rounded down).
     ///
-    /// Returns 0 if no response times have been recorded.
+    /// Returns 0 if no response times have been recorded — a real zero,
+    /// distinct from `NotFound` for an artist with no metrics record at all
+    /// (#46).
     ///
     /// Closes #602 – response time analytics.
     pub fn get_avg_response_time(env: Env, artist: Address) -> Result<u64, AnalyticsError> {
-        let m = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)?;
+        let m = Self::load_metrics(&env, &artist)?;
 
         if m.response_time_count == 0 {
             return Ok(0);
@@ -291,15 +287,12 @@ impl AnalyticsContract {
 
     /// Return the average satisfaction score × 10 (rounded down).
     ///
-    /// Returns 0 if no scores have been recorded.
+    /// Returns 0 if no scores have been recorded — a real zero, distinct from
+    /// `NotFound` for an artist with no metrics record at all (#46).
     ///
     /// Closes #602 – client satisfaction trends.
     pub fn get_avg_satisfaction(env: Env, artist: Address) -> Result<u32, AnalyticsError> {
-        let m = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)?;
+        let m = Self::load_metrics(&env, &artist)?;
 
         if m.satisfaction_score_count == 0 {
             return Ok(0);
@@ -314,15 +307,13 @@ impl AnalyticsContract {
     /// commission). Callers can project by multiplying this by an expected
     /// number of upcoming commissions.
     ///
-    /// Returns 0 if no earnings have been recorded.
+    /// Returns 0 if the artist has a metrics record but no completed
+    /// commissions — a real zero, distinct from `NotFound` for an artist with
+    /// no record at all (#46).
     ///
     /// Closes #602 – earnings predictions.
     pub fn predict_earnings(env: Env, artist: Address) -> Result<i128, AnalyticsError> {
-        let m = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)?;
+        let m = Self::load_metrics(&env, &artist)?;
 
         if m.completed_count == 0 {
             return Ok(0);
@@ -488,6 +479,32 @@ impl AnalyticsContract {
     }
 
     // ── Internal helpers ───────────────────────────────────────────────────
+
+    /// Load one artist's aggregate, keeping absence, a real zero and corrupt
+    /// data as three distinct answers (#46).
+    ///
+    /// * No record at all → [`AnalyticsError::NotFound`].
+    /// * A record with a zero sample count → a genuine `0` for the derived
+    ///   query, not missing data.
+    /// * A record whose counts and sums disagree (e.g. a maintained sum with a
+    ///   zero sample count) → [`AnalyticsError::InvalidMetricData`], rather
+    ///   than averaging nonsense into a plausible-looking number.
+    fn load_metrics(env: &Env, artist: &Address) -> Result<ArtistMetrics, AnalyticsError> {
+        let m = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist.clone()))
+            .ok_or(AnalyticsError::NotFound)?;
+
+        let response_time_ok = m.response_time_count != 0 || m.response_time_sum == 0;
+        let satisfaction_ok =
+            m.satisfaction_score_count != 0 || m.satisfaction_score_sum == 0;
+        let earnings_ok = m.completed_count != 0 || m.total_earnings == 0;
+        if !(response_time_ok && satisfaction_ok && earnings_ok) {
+            return Err(AnalyticsError::InvalidMetricData);
+        }
+        Ok(m)
+    }
 
     fn require_admin(env: &Env) -> Result<Address, AnalyticsError> {
         env.storage()
