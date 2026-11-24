@@ -350,7 +350,7 @@ impl DisputeArbiter {
             return Err(DisputeError::InvalidStatus);
         }
         let current_ledger = env.ledger().sequence();
-        if current_ledger < record.deadline_ledger {
+        if !record.window_closed_at(current_ledger) {
             return Err(DisputeError::AutoResolveNotDue);
         }
         let escrow_contract = get_escrow_contract(&env)?;
@@ -402,8 +402,12 @@ impl DisputeArbiter {
         Ok(())
     }
 
-    /// Ledger at which `commission_id`'s dispute stops accepting evidence and
-    /// becomes eligible for `auto_resolve` (#977).
+    /// Ledger at which `commission_id`'s dispute stops accepting evidence
+    /// (#977).
+    ///
+    /// This is the first ledger at which evidence is refused and `auto_resolve`
+    /// becomes callable; the ledger before it is the last one that accepts
+    /// evidence (#40).
     pub fn get_dispute_deadline(env: Env, commission_id: Bytes) -> Result<u32, DisputeError> {
         Ok(load_dispute(&env, &commission_id)?.deadline_ledger)
     }
@@ -415,11 +419,14 @@ impl DisputeArbiter {
         Ok(deadline.saturating_sub(env.ledger().sequence()))
     }
 
-    /// Submit one piece of evidence for an open dispute, up to its deadline.
+    /// Submit one piece of evidence for an open dispute, while its window is
+    /// still open.
     ///
-    /// The deadline is read before any state write (#977, #853). Submitting
-    /// after it is rejected with [`DisputeError::EvidenceWindowClosed`], so
-    /// evidence is time-boxed rather than open-ended.
+    /// The deadline is read before any state write (#977, #853). `deadline_ledger`
+    /// is the first ledger at which the window is closed, so a submission at
+    /// that ledger is rejected with [`DisputeError::EvidenceWindowClosed`]: the
+    /// same ledger at which `auto_resolve` becomes callable, which is what stops
+    /// the two windows from overlapping (#40).
     pub fn submit_evidence(
         env: Env,
         commission_id: Bytes,
@@ -442,8 +449,10 @@ impl DisputeArbiter {
         if record.status != DisputeStatus::Open {
             return Err(DisputeError::InvalidStatus);
         }
-        // Deadline read before the write (#977, #853).
-        if env.ledger().sequence() > record.deadline_ledger {
+        // Deadline read before the write (#977, #853), and compared against the
+        // one boundary definition so evidence and auto-resolve can never both
+        // be live at the same ledger (#40).
+        if record.window_closed_at(env.ledger().sequence()) {
             return Err(DisputeError::EvidenceWindowClosed);
         }
 
