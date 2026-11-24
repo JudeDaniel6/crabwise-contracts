@@ -855,6 +855,99 @@ fn test_upheld_appeal_restores_the_score() {
     assert_eq!(score.appeal_count, 1);
 }
 
+// ── Aggregate correctness after moderation (#49) ────────────────────────────
+
+/// Removing a review takes exactly that rating out of the aggregate, and a
+/// repeated moderation call cannot take it out twice.
+#[test]
+fn test_moderation_adjusts_aggregate_exactly_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let removed_id = make_bytes(&env, "agg1");
+    client.submit_review(&removed_id, &artist, &Address::generate(&env), &40u32, &make_string(&env, "good"));
+    client.submit_review(&make_bytes(&env, "agg2"), &artist, &Address::generate(&env), &20u32, &make_string(&env, "meh"));
+
+    let before = client.get_aggregate(&artist);
+    assert_eq!(before.total_reviews, 2);
+    assert_eq!(before.active_reviews, 2);
+    assert_eq!(before.rating_sum, 60);
+
+    client.report_review(&removed_id, &Address::generate(&env), &ReportReason::Abuse, &make_string(&env, "a"));
+    client.moderate_review(&removed_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let after = client.get_aggregate(&artist);
+    assert_eq!(after.total_reviews, 2);
+    assert_eq!(after.active_reviews, 1);
+    assert_eq!(after.rating_sum, 20, "only the removed rating leaves the sum");
+    assert_eq!(after.removed_reviews, 1);
+    assert_eq!(after.moderation_count, 1);
+
+    // The review is no longer `UnderReview`, so moderation cannot run again.
+    let retry = client.try_moderate_review(&removed_id, &ReviewStatus::Removed, &make_string(&env, "again"));
+    assert_eq!(retry, Err(Ok(ReputationError::InvalidStatus)));
+    assert_eq!(client.get_aggregate(&artist), after);
+}
+
+/// Clearing a reported review leaves its rating in the aggregate; only the
+/// moderation counter moves.
+#[test]
+fn test_clearing_a_review_keeps_its_rating_in_the_aggregate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "agg3");
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &45u32, &make_string(&env, "fine"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Other, &make_string(&env, "o"));
+    client.moderate_review(&review_id, &ReviewStatus::Cleared, &make_string(&env, "no violation"));
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.rating_sum, 45);
+    assert_eq!(score.average_rating_x10, 45);
+    assert_eq!(score.removed_reviews, 0);
+    assert_eq!(score.moderation_count, 1);
+}
+
+/// An upheld appeal restores the rating exactly once, and resolving the same
+/// appeal again changes nothing.
+#[test]
+fn test_restoration_adjusts_aggregate_exactly_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "agg4");
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Misleading, &make_string(&env, "m"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let removed = client.get_aggregate(&artist);
+    assert_eq!(removed.active_reviews, 0);
+    assert_eq!(removed.rating_sum, 0);
+    assert_eq!(removed.removed_reviews, 1);
+
+    client.file_appeal(&review_id, &artist, &make_string(&env, "unfair"));
+    client.resolve_appeal(&review_id, &AppealStatus::Upheld);
+
+    let restored = client.get_aggregate(&artist);
+    assert_eq!(restored.active_reviews, 1);
+    assert_eq!(restored.rating_sum, 30);
+    assert_eq!(restored.removed_reviews, 0);
+    assert_eq!(restored.appeal_count, 1);
+    assert_eq!(restored.moderation_count, 1);
+
+    // The appeal is already resolved, so it cannot be upheld a second time.
+    let retry = client.try_resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert_eq!(retry, Err(Ok(ReputationError::InvalidStatus)));
+    assert_eq!(client.get_aggregate(&artist), restored);
+}
+
 // ── Appeal window (#976) ────────────────────────────────────────────────────
 
 #[test]

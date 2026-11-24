@@ -281,23 +281,24 @@ impl ReputationContract {
         }
 
         // Status is guaranteed `UnderReview` here, so the review is currently
-        // active; removing it takes it out of the active average.
-        review.status = new_status.clone();
+        // active; removing it takes it out of the active average while a
+        // `Cleared` review keeps its rating.
+        let previous_status = review.status;
         review.status = new_status;
         env.storage()
             .persistent()
             .set(&DataKey::Review(review_id.clone()), &review);
 
-        // #974: moderation changes the score intentionally — removing a review
-        // takes it out of the active average; clearing it leaves the rating in
-        // place.
+        // #49: the aggregate adjustment is derived from the stored transition
+        // in `score.rs`, so moderation can only move it once per status change.
         let mut aggregate = load_aggregate(&env, &review.artist);
         aggregate.moderation_count = aggregate.moderation_count.saturating_add(1);
-        if new_status == ReviewStatus::Removed {
-            aggregate.active_reviews = aggregate.active_reviews.saturating_sub(1);
-            aggregate.rating_sum = aggregate.rating_sum.saturating_sub(review.rating_x10);
-            aggregate.removed_reviews = aggregate.removed_reviews.saturating_add(1);
-        }
+        score::apply_review_status_change(
+            &mut aggregate,
+            review.rating_x10,
+            previous_status,
+            new_status,
+        );
         save_aggregate(&env, &aggregate);
 
         let mod_count: u32 = env.storage()
@@ -434,17 +435,20 @@ impl ReputationContract {
                 .persistent()
                 .get(&DataKey::Review(review_id.clone()))
                 .ok_or(ReputationError::ReviewNotFound)?;
-            let was_removed = review.status == ReviewStatus::Removed;
+            let previous_status = review.status;
             review.status = ReviewStatus::Active;
             env.storage().persistent().set(&DataKey::Review(review_id.clone()), &review);
 
-            // #974: a successful appeal reinstates a removed rating, so the
-            // subject's aggregate moves back in step with the review.
-            if was_removed {
-                let mut aggregate = load_aggregate(&env, &review.artist);
-                aggregate.active_reviews = aggregate.active_reviews.saturating_add(1);
-                aggregate.rating_sum = aggregate.rating_sum.saturating_add(review.rating_x10);
-                aggregate.removed_reviews = aggregate.removed_reviews.saturating_sub(1);
+            // #49: a successful appeal reinstates a removed rating. The shared
+            // helper decides whether anything actually moved, so resolving an
+            // appeal on a review that was never removed is a no-op.
+            let mut aggregate = load_aggregate(&env, &review.artist);
+            if score::apply_review_status_change(
+                &mut aggregate,
+                review.rating_x10,
+                previous_status,
+                ReviewStatus::Active,
+            ) {
                 save_aggregate(&env, &aggregate);
             }
         }
