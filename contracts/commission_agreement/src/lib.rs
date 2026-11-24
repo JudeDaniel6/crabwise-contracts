@@ -63,6 +63,27 @@ fn load_agreement(env: &Env, commission_id: &Bytes) -> Result<AgreementRecord, A
         .ok_or(AgreementError::NotFound)
 }
 
+/// Load an active agreement and authorize the caller to decide one of its
+/// milestones (closes #36).
+///
+/// Milestone decisions belong to the agreement's client alone. The artist and
+/// any unrelated address are rejected by `require_auth` before any state is
+/// read or written, so this gate is shared by every milestone decision entry
+/// point rather than re-implemented per function.
+fn authorize_milestone_decision(
+    env: &Env,
+    commission_id: &Bytes,
+) -> Result<AgreementRecord, AgreementError> {
+    let record = load_agreement(env, commission_id)?;
+    record.client.require_auth();
+
+    if record.status != AgreementStatus::Active {
+        return Err(AgreementError::InvalidStatus);
+    }
+
+    Ok(record)
+}
+
 /// Value of the milestones the client has already approved. This is the basis
 /// for the pro-rata split on cancellation.
 fn approved_total(env: &Env, commission_id: &Bytes) -> i128 {
@@ -332,16 +353,12 @@ impl CommissionAgreementContract {
         Ok(())
     }
 
+    /// Approve a pending milestone (client auth required).
+    ///
+    /// Closes #36 – milestone decisions are client-only, and the authorization
+    /// matrix is asserted in `agency_tests.rs`.
     pub fn approve_milestone(env: Env, commission_id: Bytes, milestone_id: Bytes) -> Result<(), AgreementError> {
-        let mut record: AgreementRecord = env.storage().persistent()
-            .get(&DataKey::Agreement(commission_id.clone()))
-            .ok_or(AgreementError::NotFound)?;
-
-        record.client.require_auth();
-
-        if record.status != AgreementStatus::Active {
-            return Err(AgreementError::InvalidStatus);
-        }
+        let mut record = authorize_milestone_decision(&env, &commission_id)?;
 
         // ── Serialization lock for milestone state transitions (closes #589) ─
         // Acquire the lock before reading the milestone status.  Any concurrent
@@ -377,6 +394,34 @@ impl CommissionAgreementContract {
         env.storage().persistent().remove(&lock_key);
 
         env.events().publish((symbol_short!("ms_apprvd"),), (commission_id, milestone_id));
+        Ok(())
+    }
+
+    /// Reject a pending milestone (client auth required).
+    ///
+    /// A rejected milestone is terminal: it cannot later be approved, and it
+    /// never counts toward agreement completion. Rejecting one milestone does
+    /// not cancel the agreement. Closes #36.
+    pub fn reject_milestone(env: Env, commission_id: Bytes, milestone_id: Bytes) -> Result<(), AgreementError> {
+        let _record = authorize_milestone_decision(&env, &commission_id)?;
+
+        let lock_key = acquire_milestone_lock(&env, &commission_id, &milestone_id)?;
+
+        let mut milestone: MilestoneRecord = env.storage().persistent()
+            .get(&DataKey::Milestone(commission_id.clone(), milestone_id.clone()))
+            .ok_or(AgreementError::NotFound)?;
+
+        if milestone.status != MilestoneStatus::Pending {
+            env.storage().persistent().remove(&lock_key);
+            return Err(AgreementError::InvalidStatus);
+        }
+
+        milestone.status = MilestoneStatus::Rejected;
+        env.storage().persistent().set(&DataKey::Milestone(commission_id.clone(), milestone_id.clone()), &milestone);
+        replace_milestone(&env, &commission_id, &milestone_id, &milestone);
+
+        env.events().publish((symbol_short!("ms_rjct"),), (commission_id, milestone_id));
+        env.storage().persistent().remove(&lock_key);
         Ok(())
     }
 
