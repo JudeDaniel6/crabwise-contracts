@@ -50,6 +50,30 @@ fn load_aggregate(env: &Env, subject: &Address) -> ReviewAggregate {
         })
 }
 
+/// Refresh the retention of a review that is part of an active moderation
+/// workflow (#054).
+///
+/// Reports, moderation and appeals rewrite the review with `set`, which resets
+/// its TTL to the host default. Refreshing to [`REPUTATION_TTL_LEDGERS`] here
+/// keeps the review available while its report or appeal is being decided,
+/// instead of letting the record expire mid-workflow.
+fn extend_review_ttl(env: &Env, review_id: &Bytes) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Review(review_id.clone()),
+        REPUTATION_TTL_LEDGERS,
+        REPUTATION_TTL_LEDGERS,
+    );
+}
+
+/// Refresh the retention of an appeal while it is still open (#054).
+fn extend_appeal_ttl(env: &Env, review_id: &Bytes) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Appeal(review_id.clone()),
+        REPUTATION_TTL_LEDGERS,
+        REPUTATION_TTL_LEDGERS,
+    );
+}
+
 fn save_aggregate(env: &Env, aggregate: &ReviewAggregate) {
     let key = DataKey::Aggregate(aggregate.subject.clone());
     env.storage().persistent().set(&key, aggregate);
@@ -212,6 +236,7 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Review(review_id.clone()), &review);
+        extend_review_ttl(&env, &review_id);
 
         let queue_size: u32 = env.storage()
             .instance()
@@ -265,6 +290,7 @@ impl ReputationContract {
         env.storage()
             .persistent()
             .set(&DataKey::Review(review_id.clone()), &review);
+        extend_review_ttl(&env, &review_id);
 
         // #974: moderation changes the score intentionally — removing a review
         // takes it out of the active average; clearing it leaves the rating in
@@ -370,11 +396,10 @@ impl ReputationContract {
             window_deadline_ledger: deadline,
         };
         env.storage().persistent().set(&DataKey::Appeal(review_id.clone()), &appeal);
-        env.storage().persistent().extend_ttl(
-            &DataKey::Appeal(review_id.clone()),
-            REPUTATION_TTL_LEDGERS,
-            REPUTATION_TTL_LEDGERS,
-        );
+        // The appeal is open: keep both it and the review it targets retained
+        // while the admin decides (#054).
+        extend_appeal_ttl(&env, &review_id);
+        extend_review_ttl(&env, &review_id);
 
         let mut aggregate = load_aggregate(&env, &review.artist);
         aggregate.appeal_count = aggregate.appeal_count.saturating_add(1);
@@ -406,6 +431,7 @@ impl ReputationContract {
 
         appeal.status = decision;
         env.storage().persistent().set(&DataKey::Appeal(review_id.clone()), &appeal);
+        extend_appeal_ttl(&env, &review_id);
 
         if decision == AppealStatus::Upheld {
             let mut review: ReviewRecord = env.storage()
@@ -415,6 +441,7 @@ impl ReputationContract {
             let was_removed = review.status == ReviewStatus::Removed;
             review.status = ReviewStatus::Active;
             env.storage().persistent().set(&DataKey::Review(review_id.clone()), &review);
+            extend_review_ttl(&env, &review_id);
 
             // #974: a successful appeal reinstates a removed rating, so the
             // subject's aggregate moves back in step with the review.
@@ -473,6 +500,7 @@ impl ReputationContract {
 
         appeal.status = AppealStatus::Escalated;
         env.storage().persistent().set(&DataKey::Appeal(review_id.clone()), &appeal);
+        extend_appeal_ttl(&env, &review_id);
 
         env.events().publish((symbol_short!("escalated"),), (review_id, appellant));
         Ok(())
