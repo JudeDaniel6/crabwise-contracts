@@ -20,7 +20,7 @@ mod tests;
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Bytes, Env, String};
 
 use errors::AnalyticsError;
-use types::{ArtistMetrics, DataKey, EarningsRecord};
+use types::{ArtistMetrics, DataKey, EarningsPage, EarningsPageRequest, EarningsRecord};
 
 /// Ledger TTL for persistent analytics data (~90 days at 6 s/ledger).
 const ANALYTICS_TTL_LEDGERS: u32 = 1_296_000;
@@ -385,21 +385,41 @@ impl AnalyticsContract {
         from_index: u32,
         limit: u32,
     ) -> Result<soroban_sdk::Vec<EarningsRecord>, AnalyticsError> {
-        let cap = limit.min(MAX_EARNING_PAGE);
-        let end = from_index.saturating_add(cap);
-        let mut out: soroban_sdk::Vec<EarningsRecord> = soroban_sdk::Vec::new(&env);
-        let mut idx = from_index;
-        while idx < end {
-            if let Some(record) = env
-                .storage()
-                .persistent()
-                .get::<DataKey, EarningsRecord>(&DataKey::Earning(artist.clone(), idx))
-            {
-                out.push_back(record);
-            }
-            idx = idx.saturating_add(1);
-        }
-        Ok(out)
+        Ok(read_earnings_range(&env, &artist, from_index, limit))
+    }
+
+    /// Return one bounded page of earnings history together with its cursor
+    /// (#47).
+    ///
+    /// Unlike [`get_earnings`](Self::get_earnings), the response carries
+    /// `next_index`, which advances by the requested range rather than by the
+    /// number of records returned. A client that has pruned records in the
+    /// range therefore still walks forward without re-reading an overlapping
+    /// page. Reads are clamped to [`MAX_EARNING_PAGE`] just like `get_earnings`.
+    ///
+    /// `from_index` past the end is clamped to `total`, so the last page is
+    /// empty, reports `next_index == total`, and sets `has_more` to false.
+    pub fn get_earnings_page(
+        env: Env,
+        request: EarningsPageRequest,
+    ) -> Result<EarningsPage, AnalyticsError> {
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EarningCount(request.artist.clone()))
+            .unwrap_or(0u32);
+
+        let start = request.from_index.min(total);
+        let cap = request.limit.min(MAX_EARNING_PAGE);
+        let end = start.saturating_add(cap).min(total);
+        let records = read_earnings_range(&env, &request.artist, start, end - start);
+
+        Ok(EarningsPage {
+            records,
+            next_index: end,
+            total,
+            has_more: end < total,
+        })
     }
 
     // ── Retention / pruning (#651) ───────────────────────────────────────
@@ -565,5 +585,141 @@ impl AnalyticsContract {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Metrics(artist.clone()), ANALYTICS_TTL_LEDGERS, ANALYTICS_TTL_LEDGERS);
+    }
+}
+
+/// Read at most `MAX_EARNING_PAGE` indexes starting at `from_index`, skipping
+/// indexes whose records have been pruned.
+///
+/// The scan length is bounded by the caller's limit, not by the size of the
+/// log, so a page read cannot become an unbounded history walk.
+fn read_earnings_range(
+    env: &Env,
+    artist: &Address,
+    from_index: u32,
+    limit: u32,
+) -> soroban_sdk::Vec<EarningsRecord> {
+    let cap = limit.min(MAX_EARNING_PAGE);
+    let end = from_index.saturating_add(cap);
+    let mut out: soroban_sdk::Vec<EarningsRecord> = soroban_sdk::Vec::new(env);
+    let mut idx = from_index;
+    while idx < end {
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EarningsRecord>(&DataKey::Earning(artist.clone(), idx))
+        {
+            out.push_back(record);
+        }
+        idx = idx.saturating_add(1);
+    }
+    out
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn seeded_client(env: &Env, records: u32) -> (AnalyticsContractClient<'_>, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register_contract(None, AnalyticsContract);
+        let client = AnalyticsContractClient::new(env, &contract_id);
+        client.initialize(&admin);
+
+        let artist = Address::generate(env);
+        let payer = Address::generate(env);
+        let commission_id = Bytes::from_slice(env, b"commission");
+        let category = String::from_str(env, "ui");
+        for i in 1..=records {
+            client.record_earning(
+                &artist,
+                &commission_id,
+                &category,
+                &payer,
+                &(i as i128),
+            );
+        }
+        (client, artist)
+    }
+
+    #[test]
+    fn pages_are_bounded_and_do_not_overlap() {
+        let env = Env::default();
+        let (client, artist) = seeded_client(&env, 105);
+
+        let mut cursor = 0u32;
+        let mut seen = 0u32;
+        loop {
+            let page = client.get_earnings_page(&EarningsPageRequest {
+                artist: artist.clone(),
+                from_index: cursor,
+                limit: 50,
+            });
+
+            assert!(page.records.len() <= 50, "a page must stay bounded");
+            assert_eq!(page.total, 105);
+            for record in page.records.iter() {
+                seen += 1;
+                assert_eq!(record.amount, seen as i128, "no record may be repeated");
+            }
+
+            assert!(page.next_index >= cursor, "the cursor must move forward");
+            cursor = page.next_index;
+            if !page.has_more {
+                break;
+            }
+            assert!(cursor < page.total);
+        }
+
+        assert_eq!(seen, 105);
+        assert_eq!(cursor, 105);
+    }
+
+    #[test]
+    fn page_limit_is_clamped_to_the_maximum() {
+        let env = Env::default();
+        let (client, artist) = seeded_client(&env, 60);
+
+        let page = client.get_earnings_page(&EarningsPageRequest {
+            artist,
+            from_index: 0,
+            limit: 1_000,
+        });
+        assert_eq!(page.records.len(), MAX_EARNING_PAGE);
+        assert_eq!(page.next_index, MAX_EARNING_PAGE);
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_is_an_empty_final_page() {
+        let env = Env::default();
+        let (client, artist) = seeded_client(&env, 5);
+
+        let page = client.get_earnings_page(&EarningsPageRequest {
+            artist,
+            from_index: 99,
+            limit: 10,
+        });
+        assert_eq!(page.records.len(), 0);
+        assert_eq!(page.next_index, 5);
+        assert_eq!(page.total, 5);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn a_zero_limit_reads_nothing_and_does_not_advance() {
+        let env = Env::default();
+        let (client, artist) = seeded_client(&env, 3);
+
+        let page = client.get_earnings_page(&EarningsPageRequest {
+            artist,
+            from_index: 0,
+            limit: 0,
+        });
+        assert_eq!(page.records.len(), 0);
+        assert_eq!(page.next_index, 0);
+        assert!(page.has_more);
     }
 }
