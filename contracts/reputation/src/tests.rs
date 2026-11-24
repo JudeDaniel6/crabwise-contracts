@@ -8,6 +8,7 @@ use soroban_sdk::{
 use crate::{
     ReputationContract, ReputationContractClient,
     errors::ReputationError,
+    score::{MAX_RATING_X10, MIN_RATING_X10},
     types::{
         AppealStatus, DataKey, ReportReason, ReviewStatus, DEFAULT_APPEAL_WINDOW_LEDGERS,
         MAX_APPEAL_WINDOW_LEDGERS, MAX_QUEUE_SIZE,
@@ -123,12 +124,11 @@ fn test_submit_review_boundary_ratings_ok() {
     env.mock_all_auths();
     let (client, _admin) = setup(&env);
     let artist = Address::generate(&env);
-    let reviewer = Address::generate(&env);
     // Min
     client.submit_review(
         &make_bytes(&env, "r4"),
         &artist,
-        &reviewer,
+        &Address::generate(&env),
         &10u32,
         &make_string(&env, "min"),
     );
@@ -136,10 +136,130 @@ fn test_submit_review_boundary_ratings_ok() {
     client.submit_review(
         &make_bytes(&env, "r5"),
         &artist,
-        &reviewer,
+        &Address::generate(&env),
         &50u32,
         &make_string(&env, "max"),
     );
+}
+
+// ── Duplicate reviews (#48) ────────────────────────────────────────────────
+
+/// A client may leave only one review per artist, whichever review id they use,
+/// and the rejected attempt leaves the aggregate untouched.
+#[test]
+fn test_duplicate_review_from_same_client_keeps_aggregate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "d1"),
+        &artist,
+        &reviewer,
+        &40u32,
+        &make_string(&env, "good"),
+    );
+    let before = client.get_aggregate(&artist);
+
+    // Same client, same artist — a different review id must not be enough.
+    let result = client.try_submit_review(
+        &make_bytes(&env, "d2"),
+        &artist,
+        &reviewer,
+        &50u32,
+        &make_string(&env, "again"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::DuplicateReview)));
+    assert_eq!(client.get_aggregate(&artist), before);
+    assert_eq!(client.get_score(&artist).total_reviews, 1);
+    assert_eq!(client.get_score(&artist).rating_sum, 40);
+}
+
+/// Reusing a review id is rejected as a duplicate too, even from a new client.
+#[test]
+fn test_duplicate_review_id_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "same"),
+        &artist,
+        &Address::generate(&env),
+        &30u32,
+        &make_string(&env, "first"),
+    );
+    let before = client.get_aggregate(&artist);
+
+    let result = client.try_submit_review(
+        &make_bytes(&env, "same"),
+        &artist,
+        &Address::generate(&env),
+        &50u32,
+        &make_string(&env, "overwrite"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::DuplicateReview)));
+    assert_eq!(client.get_aggregate(&artist), before);
+    // The original record is intact.
+    assert_eq!(client.get_review(&make_bytes(&env, "same")).rating_x10, 30);
+}
+
+/// The unique key is per artist: the same client may still review other artists.
+#[test]
+fn test_same_client_can_review_different_artists() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let reviewer = Address::generate(&env);
+    let artist_a = Address::generate(&env);
+    let artist_b = Address::generate(&env);
+
+    client.submit_review(
+        &make_bytes(&env, "a1"),
+        &artist_a,
+        &reviewer,
+        &40u32,
+        &make_string(&env, "a"),
+    );
+    client.submit_review(
+        &make_bytes(&env, "b1"),
+        &artist_b,
+        &reviewer,
+        &20u32,
+        &make_string(&env, "b"),
+    );
+
+    assert_eq!(client.get_score(&artist_a).total_reviews, 1);
+    assert_eq!(client.get_score(&artist_b).total_reviews, 1);
+}
+
+/// Removing a review does not free the key: the same client cannot file a
+/// replacement rating after moderation.
+#[test]
+fn test_removed_review_still_blocks_a_new_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let review_id = make_bytes(&env, "gone");
+    client.submit_review(&review_id, &artist, &reviewer, &10u32, &make_string(&env, "bad"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let result = client.try_submit_review(
+        &make_bytes(&env, "retry"),
+        &artist,
+        &reviewer,
+        &50u32,
+        &make_string(&env, "retry"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::DuplicateReview)));
 }
 
 // ── Review reporting ───────────────────────────────────────────────────────
@@ -201,6 +321,81 @@ fn test_report_review_increments_count() {
         &review_id, &reporter2, &ReportReason::Misleading, &make_string(&env, "b"),
     );
     assert_eq!(result2, Err(Ok(ReputationError::InvalidStatus)));
+}
+
+#[test]
+fn test_duplicate_reporter_is_rejected_without_adding_a_report() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let review_id = make_bytes(&env, "dup-reporter");
+
+    client.submit_review(&review_id, &artist, &reviewer, &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &reporter, &ReportReason::Spam, &make_string(&env, "first"));
+
+    // The first report moved the review to UnderReview; a second report from
+    // the same address is rejected as a duplicate before the status check, and
+    // must not consume a report slot.
+    let result = client.try_report_review(
+        &review_id,
+        &reporter,
+        &ReportReason::Abuse,
+        &make_string(&env, "second"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::AlreadyReported)));
+    assert_eq!(client.get_report_count(&review_id), 1);
+}
+
+#[test]
+fn test_new_report_after_prior_report_is_dismissed_is_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let reporter1 = Address::generate(&env);
+    let reporter2 = Address::generate(&env);
+    let review_id = make_bytes(&env, "dismissed");
+
+    client.submit_review(&review_id, &artist, &reviewer, &40u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &reporter1, &ReportReason::Spam, &make_string(&env, "spam"));
+    client.moderate_review(&review_id, &ReviewStatus::Cleared, &make_string(&env, "no violation"));
+
+    // A cleared review is reportable again, and the dismissed report still
+    // counts toward the per-review budget.
+    client.report_review(&review_id, &reporter2, &ReportReason::Misleading, &make_string(&env, "still bad"));
+    assert_eq!(client.get_report_count(&review_id), 2);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::UnderReview);
+}
+
+#[test]
+fn test_same_reporter_cannot_report_again_after_dismissal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let review_id = make_bytes(&env, "repeat-after-clear");
+
+    client.submit_review(&review_id, &artist, &reviewer, &20u32, &make_string(&env, "meh"));
+    client.report_review(&review_id, &reporter, &ReportReason::Spam, &make_string(&env, "spam"));
+    client.moderate_review(&review_id, &ReviewStatus::Cleared, &make_string(&env, "dismissed"));
+
+    let result = client.try_report_review(
+        &review_id,
+        &reporter,
+        &ReportReason::Abuse,
+        &make_string(&env, "again"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::AlreadyReported)));
+    assert_eq!(client.get_report_count(&review_id), 1);
 }
 
 #[test]
@@ -298,8 +493,9 @@ fn test_moderation_queue_size_increments() {
     let r1 = make_bytes(&env, "q1");
     let r2 = make_bytes(&env, "q2");
 
+    // Distinct reviewers: `(artist, reviewer)` is the unique review key (#48).
     client.submit_review(&r1, &artist, &reviewer, &30u32, &make_string(&env, "a"));
-    client.submit_review(&r2, &artist, &reviewer, &40u32, &make_string(&env, "b"));
+    client.submit_review(&r2, &artist, &Address::generate(&env), &40u32, &make_string(&env, "b"));
 
     client.report_review(&r1, &reporter, &ReportReason::Spam, &make_string(&env, "x"));
     let reporter2 = Address::generate(&env);
@@ -421,6 +617,114 @@ fn test_escalate_appeal() {
     assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Escalated);
 }
 
+/// A review that moderation has `Removed`, with a `Pending` appeal against it.
+fn removed_review_with_appeal(
+    env: &Env,
+    client: &ReputationContractClient<'_>,
+    suffix: &str,
+    rating_x10: u32,
+) -> (Address, Bytes) {
+    let artist = Address::generate(env);
+    let reviewer = Address::generate(env);
+    let reporter = Address::generate(env);
+    let review_id = make_bytes(env, suffix);
+
+    client.submit_review(
+        &review_id,
+        &artist,
+        &reviewer,
+        &rating_x10,
+        &make_string(env, "review"),
+    );
+    client.report_review(
+        &review_id,
+        &reporter,
+        &ReportReason::Spam,
+        &make_string(env, "report"),
+    );
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(env, "removed"));
+    client.file_appeal(&review_id, &artist, &make_string(env, "appeal"));
+
+    (artist, review_id)
+}
+
+#[test]
+fn test_appeal_status_terminal_model() {
+    assert!(!AppealStatus::Pending.is_terminal());
+    assert!(!AppealStatus::Pending.is_decided());
+
+    assert!(AppealStatus::Upheld.is_terminal());
+    assert!(AppealStatus::Upheld.is_decided());
+
+    assert!(AppealStatus::Denied.is_terminal());
+    assert!(AppealStatus::Denied.is_decided());
+
+    // Escalated is terminal for this contract but carries no decision: the
+    // appeal belongs to the dispute arbiter from that point on.
+    assert!(AppealStatus::Escalated.is_terminal());
+    assert!(!AppealStatus::Escalated.is_decided());
+}
+
+#[test]
+fn test_repeated_upheld_decision_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "dup-upheld", 40);
+    client.resolve_appeal(&review_id, &AppealStatus::Upheld);
+    let score_after_decision = client.get_score(&artist);
+
+    let result = client.try_resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+
+    // The first decision stands, and the review is not reinstated twice.
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Upheld);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Active);
+    assert_eq!(client.get_score(&artist), score_after_decision);
+}
+
+#[test]
+fn test_conflicting_decision_after_denial_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "conflict", 40);
+    client.resolve_appeal(&review_id, &AppealStatus::Denied);
+    let score_after_decision = client.get_score(&artist);
+    assert_eq!(score_after_decision.active_reviews, 0);
+    assert_eq!(score_after_decision.removed_reviews, 1);
+
+    // A later `Upheld` must not overturn the denial.
+    let result = client.try_resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Denied);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Removed);
+    assert_eq!(client.get_score(&artist), score_after_decision);
+}
+
+#[test]
+fn test_no_decision_is_allowed_after_escalation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "escalated", 30);
+    client.escalate_appeal(&review_id, &artist);
+    let score_after_escalation = client.get_score(&artist);
+
+    for decision in [AppealStatus::Upheld, AppealStatus::Denied] {
+        let result = client.try_resolve_appeal(&review_id, &decision);
+        assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+    }
+
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Escalated);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Removed);
+    assert_eq!(client.get_score(&artist), score_after_escalation);
+}
+
 #[test]
 fn test_third_party_cannot_file_appeal() {
     let env = Env::default();
@@ -472,6 +776,111 @@ fn test_score_reflects_submitted_reviews() {
     assert_eq!(score.average_rating_x10, 40);
     assert_eq!(score.removed_reviews, 0);
     assert_eq!(score.appeal_count, 0);
+}
+
+#[test]
+fn test_score_at_the_lowest_accepted_rating() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "low"),
+        &artist,
+        &Address::generate(&env),
+        &MIN_RATING_X10,
+        &make_string(&env, "lowest accepted"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 1);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.rating_sum, MIN_RATING_X10);
+    assert_eq!(score.average_rating_x10, MIN_RATING_X10);
+    // (10 + 30*3) / (1 + 3) = 100 / 4 = 25.
+    assert_eq!(score.weighted_score_x10, 25);
+}
+
+#[test]
+fn test_score_at_the_highest_accepted_rating() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "high"),
+        &artist,
+        &Address::generate(&env),
+        &MAX_RATING_X10,
+        &make_string(&env, "highest accepted"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 1);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.rating_sum, MAX_RATING_X10);
+    assert_eq!(score.average_rating_x10, MAX_RATING_X10);
+    // (50 + 30*3) / (1 + 3) = 140 / 4 = 35.
+    assert_eq!(score.weighted_score_x10, 35);
+}
+
+#[test]
+fn test_score_mixes_the_lowest_and_highest_ratings() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "mix-low"),
+        &artist,
+        &Address::generate(&env),
+        &MIN_RATING_X10,
+        &make_string(&env, "low"),
+    );
+    client.submit_review(
+        &make_bytes(&env, "mix-high"),
+        &artist,
+        &Address::generate(&env),
+        &MAX_RATING_X10,
+        &make_string(&env, "high"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 2);
+    assert_eq!(score.active_reviews, 2);
+    assert_eq!(score.rating_sum, MIN_RATING_X10 + MAX_RATING_X10);
+    assert_eq!(score.average_rating_x10, 30);
+    // (60 + 90) / (2 + 3) = 150 / 5 = 30.
+    assert_eq!(score.weighted_score_x10, 30);
+}
+
+#[test]
+fn test_score_stays_consistent_after_removing_a_review() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let low_id = make_bytes(&env, "rm-low");
+    let high_id = make_bytes(&env, "rm-high");
+    client.submit_review(&low_id, &artist, &Address::generate(&env), &MIN_RATING_X10, &make_string(&env, "low"));
+    client.submit_review(&high_id, &artist, &Address::generate(&env), &MAX_RATING_X10, &make_string(&env, "high"));
+
+    // Remove only the highest-rated review.
+    client.report_review(&high_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&high_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 2);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.removed_reviews, 1);
+    assert_eq!(score.rating_sum, MIN_RATING_X10);
+    assert_eq!(score.average_rating_x10, MIN_RATING_X10);
+    // Back to a single lowest-rated review: (10 + 90) / 4 = 25.
+    assert_eq!(score.weighted_score_x10, 25);
 }
 
 #[test]
@@ -530,6 +939,99 @@ fn test_upheld_appeal_restores_the_score() {
     assert_eq!(score.appeal_count, 1);
 }
 
+// ── Aggregate correctness after moderation (#49) ────────────────────────────
+
+/// Removing a review takes exactly that rating out of the aggregate, and a
+/// repeated moderation call cannot take it out twice.
+#[test]
+fn test_moderation_adjusts_aggregate_exactly_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let removed_id = make_bytes(&env, "agg1");
+    client.submit_review(&removed_id, &artist, &Address::generate(&env), &40u32, &make_string(&env, "good"));
+    client.submit_review(&make_bytes(&env, "agg2"), &artist, &Address::generate(&env), &20u32, &make_string(&env, "meh"));
+
+    let before = client.get_aggregate(&artist);
+    assert_eq!(before.total_reviews, 2);
+    assert_eq!(before.active_reviews, 2);
+    assert_eq!(before.rating_sum, 60);
+
+    client.report_review(&removed_id, &Address::generate(&env), &ReportReason::Abuse, &make_string(&env, "a"));
+    client.moderate_review(&removed_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let after = client.get_aggregate(&artist);
+    assert_eq!(after.total_reviews, 2);
+    assert_eq!(after.active_reviews, 1);
+    assert_eq!(after.rating_sum, 20, "only the removed rating leaves the sum");
+    assert_eq!(after.removed_reviews, 1);
+    assert_eq!(after.moderation_count, 1);
+
+    // The review is no longer `UnderReview`, so moderation cannot run again.
+    let retry = client.try_moderate_review(&removed_id, &ReviewStatus::Removed, &make_string(&env, "again"));
+    assert_eq!(retry, Err(Ok(ReputationError::InvalidStatus)));
+    assert_eq!(client.get_aggregate(&artist), after);
+}
+
+/// Clearing a reported review leaves its rating in the aggregate; only the
+/// moderation counter moves.
+#[test]
+fn test_clearing_a_review_keeps_its_rating_in_the_aggregate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "agg3");
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &45u32, &make_string(&env, "fine"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Other, &make_string(&env, "o"));
+    client.moderate_review(&review_id, &ReviewStatus::Cleared, &make_string(&env, "no violation"));
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.rating_sum, 45);
+    assert_eq!(score.average_rating_x10, 45);
+    assert_eq!(score.removed_reviews, 0);
+    assert_eq!(score.moderation_count, 1);
+}
+
+/// An upheld appeal restores the rating exactly once, and resolving the same
+/// appeal again changes nothing.
+#[test]
+fn test_restoration_adjusts_aggregate_exactly_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "agg4");
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Misleading, &make_string(&env, "m"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let removed = client.get_aggregate(&artist);
+    assert_eq!(removed.active_reviews, 0);
+    assert_eq!(removed.rating_sum, 0);
+    assert_eq!(removed.removed_reviews, 1);
+
+    client.file_appeal(&review_id, &artist, &make_string(&env, "unfair"));
+    client.resolve_appeal(&review_id, &AppealStatus::Upheld);
+
+    let restored = client.get_aggregate(&artist);
+    assert_eq!(restored.active_reviews, 1);
+    assert_eq!(restored.rating_sum, 30);
+    assert_eq!(restored.removed_reviews, 0);
+    assert_eq!(restored.appeal_count, 1);
+    assert_eq!(restored.moderation_count, 1);
+
+    // The appeal is already resolved, so it cannot be upheld a second time.
+    let retry = client.try_resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert_eq!(retry, Err(Ok(ReputationError::InvalidStatus)));
+    assert_eq!(client.get_aggregate(&artist), restored);
+}
+
 // ── Appeal window (#976) ────────────────────────────────────────────────────
 
 #[test]
@@ -555,40 +1057,6 @@ fn test_appeal_deadline_is_review_ledger_plus_window() {
 }
 
 #[test]
-fn test_file_appeal_at_the_boundary_is_allowed() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = setup(&env);
-
-    let artist = Address::generate(&env);
-    let review_id = make_bytes(&env, "w2");
-    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
-    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
-    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
-
-    env.ledger().with_mut(|l| l.sequence_number = DEFAULT_APPEAL_WINDOW_LEDGERS);
-    client.file_appeal(&review_id, &artist, &make_string(&env, "just in time"));
-    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Pending);
-}
-
-#[test]
-fn test_file_appeal_past_the_window_is_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = setup(&env);
-
-    let artist = Address::generate(&env);
-    let review_id = make_bytes(&env, "w3");
-    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
-    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
-    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
-
-    env.ledger().with_mut(|l| l.sequence_number = DEFAULT_APPEAL_WINDOW_LEDGERS + 1);
-    let result = client.try_file_appeal(&review_id, &artist, &make_string(&env, "too late"));
-    assert_eq!(result, Err(Ok(ReputationError::AppealWindowClosed)));
-}
-
-#[test]
 fn test_set_appeal_window_rejects_out_of_range() {
     let env = Env::default();
     env.mock_all_auths();
@@ -603,20 +1071,66 @@ fn test_set_appeal_window_rejects_out_of_range() {
 }
 
 #[test]
-fn test_a_custom_window_bounds_filing() {
+fn test_file_appeal_immediately_before_the_boundary_is_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup(&env);
+    // A 10-ledger window keeps the ledger jump small; jumping to the default
+    // ~17k-ledger window would archive the contract's instance entry in the
+    // test host.
+    client.set_appeal_window(&admin, &10u32);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "w-before");
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    env.ledger().with_mut(|l| l.sequence_number = 9);
+    assert_eq!(client.get_appeal_deadline(&review_id), 10);
+    assert_eq!(client.ledgers_to_appeal(&review_id), 1);
+    client.file_appeal(&review_id, &artist, &make_string(&env, "one ledger left"));
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Pending);
+}
+
+#[test]
+fn test_file_appeal_at_the_boundary_is_allowed() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin) = setup(&env);
     client.set_appeal_window(&admin, &10u32);
 
     let artist = Address::generate(&env);
-    let review_id = make_bytes(&env, "w4");
+    let review_id = make_bytes(&env, "w2");
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    assert_eq!(client.get_appeal_deadline(&review_id), 10);
+    // Zero ledgers remain, but the deadline ledger itself is inclusive.
+    assert_eq!(client.ledgers_to_appeal(&review_id), 0);
+    client.file_appeal(&review_id, &artist, &make_string(&env, "just in time"));
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Pending);
+}
+
+#[test]
+fn test_file_appeal_past_the_window_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup(&env);
+    client.set_appeal_window(&admin, &10u32);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "w3");
     client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
     client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
     client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
 
     env.ledger().with_mut(|l| l.sequence_number = 11);
-    let result = client.try_file_appeal(&review_id, &artist, &make_string(&env, "late"));
+    assert_eq!(client.get_appeal_deadline(&review_id), 10);
+    assert_eq!(client.ledgers_to_appeal(&review_id), 0);
+    let result = client.try_file_appeal(&review_id, &artist, &make_string(&env, "too late"));
     assert_eq!(result, Err(Ok(ReputationError::AppealWindowClosed)));
 }
 
