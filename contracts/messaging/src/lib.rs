@@ -21,8 +21,8 @@ use soroban_sdk::{
 
 use errors::MessagingError;
 use types::{
-    Conversation, DataKey, Message, ReadReceipt, TypingIndicator, MAX_CONV_ID_LEN,
-    MAX_MESSAGE_LEN, MAX_HISTORY, RATE_LIMIT_LEDGERS,
+    is_blank_message_body, Conversation, DataKey, Message, ReadReceipt, TypingIndicator,
+    MAX_CONV_ID_LEN, MAX_MESSAGE_LEN, MAX_HISTORY, RATE_LIMIT_LEDGERS,
 };
 
 include!("../../semver_types.rs");
@@ -105,10 +105,12 @@ impl MessagingContract {
     ///
     /// The `body` field should contain the encrypted ciphertext produced by
     /// client-side encryption. The contract stores it verbatim without
-    /// inspecting plaintext content.
+    /// inspecting plaintext content, but rejects an empty or whitespace-only
+    /// payload (#055) — see [`is_blank_message_body`].
     ///
     /// Rate limiting: a sender may send at most 1 message per `RATE_LIMIT_LEDGERS`
-    /// per conversation to prevent spam.
+    /// per conversation to prevent spam. Blank bodies are rejected before the
+    /// rate-limit slot is consumed.
     ///
     /// Closes #596.
     pub fn send_message(
@@ -122,6 +124,12 @@ impl MessagingContract {
         // ── Input validation ──────────────────────────────────────────────
         if body.len() > MAX_MESSAGE_LEN {
             return Err(MessagingError::MessageTooLong);
+        }
+        // #055: reject empty and whitespace-only bodies before touching the
+        // rate-limit slot, so a rejected send does not count as the sender's
+        // one message for this window.
+        if is_blank_message_body(&body) {
+            return Err(MessagingError::EmptyMessage);
         }
 
         // ── Load conversation and verify sender is a participant ───────────
@@ -548,6 +556,36 @@ mod test {
         let messages = client.get_messages(&conv_id, &alice, &1, &10);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages.get(0).unwrap().body, body);
+    }
+
+    #[test]
+    fn test_empty_and_whitespace_only_messages_are_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MessagingContract);
+        let client = MessagingContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+        let bob = Address::generate(&env);
+
+        client.initialize(&admin);
+        let conv_id = soroban_sdk::Bytes::from_slice(&env, b"conv-blank");
+        client.create_conversation(&conv_id, &alice, &bob);
+
+        env.ledger().with_mut(|l| l.sequence_number = RATE_LIMIT_LEDGERS + 1);
+
+        for blank in ["", " ", "   ", "\t\n\r", " \t \n "] {
+            let result = client.try_send_message(&conv_id, &alice, &String::from_str(&env, blank));
+            assert_eq!(result, Err(Ok(MessagingError::EmptyMessage)), "body {blank:?}");
+        }
+        // Rejected sends must not persist or consume the rate-limit slot.
+        assert_eq!(client.get_conversation(&conv_id).message_count, 0);
+
+        let body = String::from_str(&env, "  hello  ");
+        let seq = client.send_message(&conv_id, &alice, &body);
+        assert_eq!(seq, 1);
+        assert_eq!(client.get_messages(&conv_id, &alice, &1, &1).get(0).unwrap().body, body);
     }
 
     #[test]
