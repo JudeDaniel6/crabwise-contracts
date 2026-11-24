@@ -605,21 +605,91 @@ fn test_submit_evidence_after_the_deadline_fails() {
     assert_eq!(result.unwrap_err().unwrap(), DisputeError::EvidenceWindowClosed);
 }
 
-#[test]
-fn test_oversized_evidence_is_rejected() {
-    let (env, admin, escrow, config, _token) = create_test_env();
-    let initiator = Address::generate(&env);
-    let submitter = Address::generate(&env);
+// ========== evidence size boundary (#38) ==========
+
+/// An initialized arbiter holding one open dispute, ready for evidence.
+fn setup_open_dispute<'a>(env: &'a Env) -> (DisputeArbiterClient<'a>, Bytes, Address) {
+    let (admin, escrow, config) = (
+        Address::generate(env),
+        env.register_contract(None, MockEscrow),
+        env.register_contract(None, MockConfig),
+    );
     env.mock_all_auths();
     let arbiter = env.register_contract(None, DisputeArbiter);
-    let client = DisputeArbiterClient::new(&env, &arbiter);
+    let client = DisputeArbiterClient::new(env, &arbiter);
     client.initialize(&admin, &escrow, &config, &100u32);
 
-    let commission_id = Bytes::from_array(&env, &[1u8, 2, 3]);
+    let commission_id = Bytes::from_array(env, &[1u8, 2, 3]);
+    let initiator = Address::generate(env);
     client.open_dispute(&commission_id, &initiator);
-    let big = Bytes::from_slice(&env, &[7u8; 1025]);
-    let result = client.try_submit_evidence(&commission_id, &submitter, &big);
+    (client, commission_id, initiator)
+}
+
+#[test]
+fn test_minimum_evidence_size_is_accepted() {
+    let env = Env::default();
+    let (client, commission_id, _initiator) = setup_open_dispute(&env);
+    let submitter = Address::generate(&env);
+
+    client.submit_evidence(&commission_id, &submitter, &Bytes::from_slice(&env, &[1u8]));
+
+    assert_eq!(client.get_evidence_count(&commission_id), 1);
+    assert_eq!(client.get_evidence(&commission_id, &0u32).evidence.len(), 1);
+}
+
+#[test]
+fn test_maximum_evidence_size_is_accepted() {
+    let env = Env::default();
+    let (client, commission_id, _initiator) = setup_open_dispute(&env);
+    let submitter = Address::generate(&env);
+
+    let max = crate::MAX_EVIDENCE_LEN as usize;
+    let blob = Bytes::from_slice(&env, &[3u8; crate::MAX_EVIDENCE_LEN as usize]);
+    client.submit_evidence(&commission_id, &submitter, &blob);
+
+    assert_eq!(client.get_evidence_count(&commission_id), 1);
+    assert_eq!(
+        client.get_evidence(&commission_id, &0u32).evidence.len(),
+        crate::MAX_EVIDENCE_LEN
+    );
+    assert_eq!(max as u32, client.get_max_evidence_len());
+}
+
+#[test]
+fn test_evidence_over_the_size_limit_is_rejected() {
+    let env = Env::default();
+    let (client, commission_id, _initiator) = setup_open_dispute(&env);
+    let submitter = Address::generate(&env);
+
+    let too_big = Bytes::from_slice(&env, &[7u8; crate::MAX_EVIDENCE_LEN as usize + 1]);
+    let result = client.try_submit_evidence(&commission_id, &submitter, &too_big);
+
     assert_eq!(result.unwrap_err().unwrap(), DisputeError::EvidenceTooLong);
+    // Rejected before any write: nothing recorded and the dispute is untouched.
+    assert_eq!(client.get_evidence_count(&commission_id), 0);
+    assert_eq!(
+        client.get_dispute(&commission_id).status,
+        DisputeStatus::Open
+    );
+}
+
+#[test]
+fn test_evidence_rejected_over_the_limit_mid_window_keeps_earlier_entries() {
+    let env = Env::default();
+    let (client, commission_id, _initiator) = setup_open_dispute(&env);
+    let submitter = Address::generate(&env);
+
+    client.submit_evidence(
+        &commission_id,
+        &submitter,
+        &Bytes::from_slice(&env, b"first"),
+    );
+    let too_big = Bytes::from_slice(&env, &[7u8; crate::MAX_EVIDENCE_LEN as usize + 1]);
+    let result = client.try_submit_evidence(&commission_id, &submitter, &too_big);
+
+    assert_eq!(result.unwrap_err().unwrap(), DisputeError::EvidenceTooLong);
+    assert_eq!(client.get_evidence_count(&commission_id), 1);
+    assert_eq!(client.get_evidence(&commission_id, &0u32).evidence.len(), 5);
 }
 
 #[test]
