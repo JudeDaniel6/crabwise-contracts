@@ -4,6 +4,8 @@ use soroban_sdk::{
     Address, Bytes, Env, String, IntoVal,
 };
 
+use crate::dispute_helpers::DisputeHelper;
+use crate::errors::DisputeError;
 use crate::errors::{get_suggestion, DisputeError};
 use crate::types::{DisputeRecord, DisputeStatus};
 use crate::{DisputeArbiter, DisputeArbiterClient};
@@ -846,6 +848,155 @@ fn test_auto_resolve_fires_at_exactly_the_deadline() {
     env.ledger().with_mut(|l| l.sequence_number = 100);
     client.auto_resolve(&commission_id);
     assert_eq!(client.get_dispute(&commission_id).status, DisputeStatus::AutoResolved);
+}
+
+// ========== resolver eligibility (#39) ==========
+
+const RESOLVED_CODE: u32 = 2;
+
+/// `DisputeHelper` calls `require_auth`, which the test host only permits
+/// inside a contract invocation, so the helper is exposed through a thin
+/// contract and every case below exercises it on-chain.
+#[contract]
+pub struct DisputeHelperHarness;
+
+#[contractimpl]
+impl DisputeHelperHarness {
+    pub fn raise_dispute(env: Env, participant: Address, dispute_id: u64) {
+        DisputeHelper::raise_dispute(&env, &participant, dispute_id);
+    }
+
+    pub fn register_parties(env: Env, dispute_id: u64, client: Address, artist: Address) {
+        DisputeHelper::register_parties(&env, dispute_id, &client, &artist);
+    }
+
+    pub fn authorize_arbiter(env: Env, who: Address) {
+        DisputeHelper::authorize_arbiter(&env, &who);
+    }
+
+    pub fn resolve_dispute(
+        env: Env,
+        resolver: Address,
+        dispute_id: u64,
+        resolution_code: u32,
+    ) -> Result<(), DisputeError> {
+        DisputeHelper::resolve_dispute(&env, &resolver, dispute_id, resolution_code)
+    }
+
+    pub fn is_party(env: Env, dispute_id: u64, who: Address) -> bool {
+        DisputeHelper::is_party(&env, dispute_id, &who)
+    }
+
+    pub fn is_arbiter(env: Env, who: Address) -> bool {
+        DisputeHelper::is_arbiter(&env, &who)
+    }
+
+    pub fn dispute_status(env: Env, dispute_id: u64) -> u32 {
+        DisputeHelper::dispute_status(&env, dispute_id)
+    }
+}
+
+/// A raised dispute between two generated parties.
+fn setup_dispute_with_parties<'a>(
+    env: &'a Env,
+) -> (DisputeHelperHarnessClient<'a>, u64, Address, Address) {
+    let dispute_id = 7u64;
+    let client = Address::generate(env);
+    let artist = Address::generate(env);
+    env.mock_all_auths();
+    let harness = env.register_contract(None, DisputeHelperHarness);
+    let helper = DisputeHelperHarnessClient::new(env, &harness);
+    helper.raise_dispute(&client, &dispute_id);
+    helper.register_parties(&dispute_id, &client, &artist);
+    (helper, dispute_id, client, artist)
+}
+
+#[test]
+fn test_client_party_cannot_resolve_its_own_dispute() {
+    let env = Env::default();
+    let (helper, dispute_id, client, _artist) = setup_dispute_with_parties(&env);
+
+    let result = helper.try_resolve_dispute(&client, &dispute_id, &RESOLVED_CODE);
+
+    assert_eq!(result.unwrap_err().unwrap(), DisputeError::Unauthorized);
+    // Refused before the write: the dispute is still open.
+    assert_eq!(helper.dispute_status(&dispute_id), 1);
+}
+
+#[test]
+fn test_artist_party_cannot_resolve_its_own_dispute() {
+    let env = Env::default();
+    let (helper, dispute_id, _client, artist) = setup_dispute_with_parties(&env);
+
+    let result = helper.try_resolve_dispute(&artist, &dispute_id, &RESOLVED_CODE);
+
+    assert_eq!(result.unwrap_err().unwrap(), DisputeError::Unauthorized);
+    assert_eq!(helper.dispute_status(&dispute_id), 1);
+}
+
+#[test]
+fn test_unauthorized_caller_cannot_resolve() {
+    let env = Env::default();
+    let (helper, dispute_id, _client, _artist) = setup_dispute_with_parties(&env);
+    let stranger = Address::generate(&env);
+
+    let result = helper.try_resolve_dispute(&stranger, &dispute_id, &RESOLVED_CODE);
+
+    assert_eq!(result.unwrap_err().unwrap(), DisputeError::Unauthorized);
+    assert_eq!(helper.dispute_status(&dispute_id), 1);
+}
+
+#[test]
+fn test_authorized_arbiter_can_resolve() {
+    let env = Env::default();
+    let (helper, dispute_id, _client, _artist) = setup_dispute_with_parties(&env);
+    let arbiter = Address::generate(&env);
+    helper.authorize_arbiter(&arbiter);
+
+    helper.resolve_dispute(&arbiter, &dispute_id, &RESOLVED_CODE);
+
+    assert_eq!(helper.dispute_status(&dispute_id), RESOLVED_CODE);
+}
+
+#[test]
+fn test_party_separately_authorized_as_arbiter_can_resolve() {
+    let env = Env::default();
+    let (helper, dispute_id, _client, artist) = setup_dispute_with_parties(&env);
+
+    // Still a party, and still refused until the role is granted separately.
+    let refused = helper.try_resolve_dispute(&artist, &dispute_id, &RESOLVED_CODE);
+    assert_eq!(refused.unwrap_err().unwrap(), DisputeError::Unauthorized);
+
+    helper.authorize_arbiter(&artist);
+    helper.resolve_dispute(&artist, &dispute_id, &RESOLVED_CODE);
+
+    assert_eq!(helper.dispute_status(&dispute_id), RESOLVED_CODE);
+}
+
+#[test]
+fn test_arbiter_authorization_is_per_address_and_idempotent() {
+    let env = Env::default();
+    let (helper, dispute_id, client, artist) = setup_dispute_with_parties(&env);
+    let arbiter = Address::generate(&env);
+
+    helper.authorize_arbiter(&arbiter);
+    helper.authorize_arbiter(&arbiter);
+
+    assert!(helper.is_arbiter(&arbiter));
+    // Being an arbiter is not the same as being one of the parties.
+    assert!(helper.is_party(&dispute_id, &client));
+    assert!(helper.is_party(&dispute_id, &artist));
+    assert!(!helper.is_party(&dispute_id, &arbiter));
+}
+
+#[test]
+fn test_eligibility_is_per_dispute() {
+    let env = Env::default();
+    let (helper, dispute_id, client, _artist) = setup_dispute_with_parties(&env);
+    let other_dispute = dispute_id + 1;
+
+    assert!(helper.is_party(&dispute_id, &client));
+    assert!(!helper.is_party(&other_dispute, &client));
 }
 
 #[test]

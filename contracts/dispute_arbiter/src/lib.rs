@@ -6,6 +6,7 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Bytes, Env, IntoVal, String};
 
+pub mod dispute_helpers;
 pub mod errors;
 pub mod types;
 
