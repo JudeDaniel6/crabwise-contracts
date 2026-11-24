@@ -8,6 +8,7 @@ use soroban_sdk::{
 use crate::{
     ReputationContract, ReputationContractClient,
     errors::ReputationError,
+    score::{MAX_RATING_X10, MIN_RATING_X10},
     types::{
         AppealStatus, ReportReason, ReviewStatus, DEFAULT_APPEAL_WINDOW_LEDGERS,
         MAX_APPEAL_WINDOW_LEDGERS, MAX_QUEUE_SIZE,
@@ -571,6 +572,111 @@ fn test_score_reflects_submitted_reviews() {
     assert_eq!(score.average_rating_x10, 40);
     assert_eq!(score.removed_reviews, 0);
     assert_eq!(score.appeal_count, 0);
+}
+
+#[test]
+fn test_score_at_the_lowest_accepted_rating() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "low"),
+        &artist,
+        &Address::generate(&env),
+        &MIN_RATING_X10,
+        &make_string(&env, "lowest accepted"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 1);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.rating_sum, MIN_RATING_X10);
+    assert_eq!(score.average_rating_x10, MIN_RATING_X10);
+    // (10 + 30*3) / (1 + 3) = 100 / 4 = 25.
+    assert_eq!(score.weighted_score_x10, 25);
+}
+
+#[test]
+fn test_score_at_the_highest_accepted_rating() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "high"),
+        &artist,
+        &Address::generate(&env),
+        &MAX_RATING_X10,
+        &make_string(&env, "highest accepted"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 1);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.rating_sum, MAX_RATING_X10);
+    assert_eq!(score.average_rating_x10, MAX_RATING_X10);
+    // (50 + 30*3) / (1 + 3) = 140 / 4 = 35.
+    assert_eq!(score.weighted_score_x10, 35);
+}
+
+#[test]
+fn test_score_mixes_the_lowest_and_highest_ratings() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "mix-low"),
+        &artist,
+        &Address::generate(&env),
+        &MIN_RATING_X10,
+        &make_string(&env, "low"),
+    );
+    client.submit_review(
+        &make_bytes(&env, "mix-high"),
+        &artist,
+        &Address::generate(&env),
+        &MAX_RATING_X10,
+        &make_string(&env, "high"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 2);
+    assert_eq!(score.active_reviews, 2);
+    assert_eq!(score.rating_sum, MIN_RATING_X10 + MAX_RATING_X10);
+    assert_eq!(score.average_rating_x10, 30);
+    // (60 + 90) / (2 + 3) = 150 / 5 = 30.
+    assert_eq!(score.weighted_score_x10, 30);
+}
+
+#[test]
+fn test_score_stays_consistent_after_removing_a_review() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let low_id = make_bytes(&env, "rm-low");
+    let high_id = make_bytes(&env, "rm-high");
+    client.submit_review(&low_id, &artist, &Address::generate(&env), &MIN_RATING_X10, &make_string(&env, "low"));
+    client.submit_review(&high_id, &artist, &Address::generate(&env), &MAX_RATING_X10, &make_string(&env, "high"));
+
+    // Remove only the highest-rated review.
+    client.report_review(&high_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&high_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 2);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.removed_reviews, 1);
+    assert_eq!(score.rating_sum, MIN_RATING_X10);
+    assert_eq!(score.average_rating_x10, MIN_RATING_X10);
+    // Back to a single lowest-rated review: (10 + 90) / 4 = 25.
+    assert_eq!(score.weighted_score_x10, 25);
 }
 
 #[test]
