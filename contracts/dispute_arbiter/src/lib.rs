@@ -93,6 +93,20 @@ fn load_dispute(env: &Env, commission_id: &Bytes) -> Result<DisputeRecord, Dispu
         .unwrap())
 }
 
+/// Load a dispute that may still be resolved (#41).
+///
+/// Every state other than [`DisputeStatus::Open`] is terminal, so a second
+/// resolution must be refused here — before any escrow call — rather than
+/// after it. That is what stops a replayed resolution from overwriting the
+/// first decision or triggering a second downstream settlement.
+fn load_open_dispute(env: &Env, commission_id: &Bytes) -> Result<DisputeRecord, DisputeError> {
+    let record = load_dispute(env, commission_id)?;
+    if record.status != DisputeStatus::Open {
+        return Err(DisputeError::AlreadyResolved);
+    }
+    Ok(record)
+}
+
 fn save_dispute(env: &Env, record: &DisputeRecord) {
     env.storage()
         .persistent()
@@ -196,10 +210,9 @@ impl DisputeArbiter {
         if note.len() > shared::validation::MAX_MEMO_LEN {
             return Err(DisputeError::NoteTooLong);
         }
-        let mut record = load_dispute(&env, &commission_id)?;
-        if record.status != DisputeStatus::Open {
-            return Err(DisputeError::InvalidStatus);
-        }
+        // Terminal states are final: a second resolution is refused before the
+        // refund below, so it cannot overwrite the first decision (#41).
+        let mut record = load_open_dispute(&env, &commission_id)?;
         let escrow_contract = get_escrow_contract(&env)?;
         let config_contract = get_config_contract(&env)?;
         env.invoke_contract::<()>(
@@ -229,10 +242,8 @@ impl DisputeArbiter {
         if note.len() > shared::validation::MAX_MEMO_LEN {
             return Err(DisputeError::NoteTooLong);
         }
-        let mut record = load_dispute(&env, &commission_id)?;
-        if record.status != DisputeStatus::Open {
-            return Err(DisputeError::InvalidStatus);
-        }
+        // #41: refuse a replay before the release call, not after it.
+        let mut record = load_open_dispute(&env, &commission_id)?;
         let escrow_contract = get_escrow_contract(&env)?;
         let config_contract = get_config_contract(&env)?;
         env.invoke_contract::<()>(
@@ -266,10 +277,8 @@ impl DisputeArbiter {
         if note.len() > shared::validation::MAX_MEMO_LEN {
             return Err(DisputeError::NoteTooLong);
         }
-        let mut record = load_dispute(&env, &commission_id)?;
-        if record.status != DisputeStatus::Open {
-            return Err(DisputeError::InvalidStatus);
-        }
+        // #41: a split is a settlement too, so it gets the same terminal guard.
+        let mut record = load_open_dispute(&env, &commission_id)?;
         let escrow_contract = get_escrow_contract(&env)?;
         let config_contract = get_config_contract(&env)?;
 
@@ -342,13 +351,13 @@ impl DisputeArbiter {
     }
 
     pub fn auto_resolve(env: Env, commission_id: Bytes) -> Result<(), DisputeError> {
+        // Guard first (#762, #41): this settlement path calls escrow, so a
+        // re-entrant call from that refund could otherwise refund twice.
+        guard::acquire(&env);
         if !has_admin(&env) {
             return Err(DisputeError::NotInitialized);
         }
-        let mut record = load_dispute(&env, &commission_id)?;
-        if record.status != DisputeStatus::Open {
-            return Err(DisputeError::InvalidStatus);
-        }
+        let mut record = load_open_dispute(&env, &commission_id)?;
         let current_ledger = env.ledger().sequence();
         if !record.window_closed_at(current_ledger) {
             return Err(DisputeError::AutoResolveNotDue);
@@ -362,6 +371,7 @@ impl DisputeArbiter {
         );
         record.status = DisputeStatus::AutoResolved;
         save_dispute(&env, &record);
+        guard::release(&env);
         env.events()
             .publish((symbol_short!("auto_res"),), (commission_id, current_ledger));
         Ok(())
