@@ -6,6 +6,7 @@ use soroban_sdk::{
     Address, Bytes, Env, String,
 };
 
+use crate::types::{ArtistMetrics, DataKey};
 use crate::{AnalyticsContract, AnalyticsContractClient, errors::AnalyticsError};
 
 fn setup(env: &Env) -> (AnalyticsContractClient<'_>, Address) {
@@ -560,6 +561,38 @@ fn test_rejected_earning_leaves_no_aggregate_or_event() {
 
 #[test]
 fn test_earning_overflow_keeps_prior_aggregate_and_events() {
+// ── Overflow safety (#43) ────────────────────────────────────────────────
+
+fn empty_metrics() -> ArtistMetrics {
+    ArtistMetrics {
+        total_earnings: 0,
+        completed_count: 0,
+        cancelled_count: 0,
+        response_time_sum: 0,
+        response_time_count: 0,
+        satisfaction_score_sum: 0,
+        satisfaction_score_count: 0,
+        last_updated_ledger: 0,
+    }
+}
+
+/// Write an aggregate straight to storage, so a counter can be positioned at
+/// its maximum without recording billions of events to get there.
+fn seed_metrics(
+    env: &Env,
+    client: &AnalyticsContractClient,
+    artist: &Address,
+    metrics: &ArtistMetrics,
+) {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Metrics(artist.clone()), metrics);
+    });
+}
+
+#[test]
+fn test_record_earning_overflow_preserves_totals() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin) = setup(&env);
@@ -578,6 +611,10 @@ fn test_earning_overflow_keeps_prior_aggregate_and_events() {
     let metrics_before = client.get_metrics(&artist);
     let events_before = event_count(&env);
 
+    let before = client.get_metrics(&artist);
+
+    // One more unit would wrap the lifetime total, so it is refused with an
+    // explicit error instead.
     let result = client.try_record_earning(
         &artist,
         &make_bytes(&env, "over"),
@@ -595,6 +632,15 @@ fn test_earning_overflow_keeps_prior_aggregate_and_events() {
 
 #[test]
 fn test_rejected_response_time_leaves_no_aggregate_or_event() {
+    // The rejected update leaves both the aggregate and the earnings log
+    // exactly as they were.
+    assert_eq!(client.get_metrics(&artist), before);
+    assert_eq!(client.get_earning_count(&artist), 1);
+    assert_eq!(client.get_earning(&artist, &0).amount, i128::MAX);
+}
+
+#[test]
+fn test_completed_count_overflow_leaves_no_earning_record() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin) = setup(&env);
@@ -613,6 +659,30 @@ fn test_rejected_response_time_leaves_no_aggregate_or_event() {
 
 #[test]
 fn test_response_time_overflow_keeps_prior_aggregate_and_events() {
+    let mut metrics = empty_metrics();
+    metrics.completed_count = u32::MAX;
+    seed_metrics(&env, &client, &artist, &metrics);
+
+    let result = client.try_record_earning(
+        &artist,
+        &make_bytes(&env, "over"),
+        &make_string(&env, "ui"),
+        &Address::generate(&env),
+        &1_000,
+    );
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+
+    assert_eq!(client.get_metrics(&artist), metrics);
+    // The failure happened before the log append, so no index was consumed.
+    assert_eq!(client.get_earning_count(&artist), 0);
+    assert_eq!(
+        client.try_get_earning(&artist, &0),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+}
+
+#[test]
+fn test_response_time_sum_overflow_preserves_totals() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin) = setup(&env);
@@ -630,6 +700,17 @@ fn test_response_time_overflow_keeps_prior_aggregate_and_events() {
 
 #[test]
 fn test_rejected_satisfaction_leaves_no_aggregate_or_event() {
+    let before = client.get_metrics(&artist);
+
+    let result = client.try_record_response_time(&artist, &1u64);
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+
+    assert_eq!(client.get_metrics(&artist), before);
+    assert_eq!(client.get_avg_response_time(&artist), u64::MAX);
+}
+
+#[test]
+fn test_satisfaction_sum_overflow_preserves_totals() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin) = setup(&env);
@@ -652,6 +733,38 @@ fn test_rejected_satisfaction_leaves_no_aggregate_or_event() {
 
 #[test]
 fn test_successful_update_emits_exactly_one_event() {
+    let mut metrics = empty_metrics();
+    metrics.satisfaction_score_sum = u32::MAX - 5;
+    metrics.satisfaction_score_count = 1;
+    seed_metrics(&env, &client, &artist, &metrics);
+
+    let result = client.try_record_satisfaction(&artist, &10u32);
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+    assert_eq!(client.get_metrics(&artist), metrics);
+}
+
+#[test]
+fn test_completion_rate_overflow_is_reported() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let mut metrics = empty_metrics();
+    metrics.completed_count = u32::MAX;
+    metrics.cancelled_count = 1;
+    seed_metrics(&env, &client, &artist, &metrics);
+
+    // The denominator would wrap, so the rate is reported as an error rather
+    // than as a bogus percentage.
+    assert_eq!(
+        client.try_get_completion_rate(&artist),
+        Err(Ok(AnalyticsError::ArithmeticOverflow)),
+    );
+}
+
+#[test]
+fn test_earning_index_overflow_leaves_no_partial_update() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin) = setup(&env);
@@ -662,6 +775,15 @@ fn test_successful_update_emits_exactly_one_event() {
     client.record_earning(
         &artist,
         &make_bytes(&env, "c1"),
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::EarningCount(artist.clone()), &u32::MAX);
+    });
+
+    let result = client.try_record_earning(
+        &artist,
+        &make_bytes(&env, "over"),
         &make_string(&env, "ui"),
         &Address::generate(&env),
         &1_000,
@@ -671,4 +793,12 @@ fn test_successful_update_emits_exactly_one_event() {
     // update, one announcement.
     assert_eq!(event_count(&env), events_before + 1);
     assert_eq!(client.get_metrics(&artist).total_earnings, 1_000);
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+
+    // Nothing was created for the artist and the index counter did not move.
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+    assert_eq!(client.get_earning_count(&artist), u32::MAX);
 }
