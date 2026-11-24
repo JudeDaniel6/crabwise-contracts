@@ -115,12 +115,11 @@ fn test_submit_review_boundary_ratings_ok() {
     env.mock_all_auths();
     let (client, _admin) = setup(&env);
     let artist = Address::generate(&env);
-    let reviewer = Address::generate(&env);
     // Min
     client.submit_review(
         &make_bytes(&env, "r4"),
         &artist,
-        &reviewer,
+        &Address::generate(&env),
         &10u32,
         &make_string(&env, "min"),
     );
@@ -128,10 +127,130 @@ fn test_submit_review_boundary_ratings_ok() {
     client.submit_review(
         &make_bytes(&env, "r5"),
         &artist,
-        &reviewer,
+        &Address::generate(&env),
         &50u32,
         &make_string(&env, "max"),
     );
+}
+
+// ── Duplicate reviews (#48) ────────────────────────────────────────────────
+
+/// A client may leave only one review per artist, whichever review id they use,
+/// and the rejected attempt leaves the aggregate untouched.
+#[test]
+fn test_duplicate_review_from_same_client_keeps_aggregate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "d1"),
+        &artist,
+        &reviewer,
+        &40u32,
+        &make_string(&env, "good"),
+    );
+    let before = client.get_aggregate(&artist);
+
+    // Same client, same artist — a different review id must not be enough.
+    let result = client.try_submit_review(
+        &make_bytes(&env, "d2"),
+        &artist,
+        &reviewer,
+        &50u32,
+        &make_string(&env, "again"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::DuplicateReview)));
+    assert_eq!(client.get_aggregate(&artist), before);
+    assert_eq!(client.get_score(&artist).total_reviews, 1);
+    assert_eq!(client.get_score(&artist).rating_sum, 40);
+}
+
+/// Reusing a review id is rejected as a duplicate too, even from a new client.
+#[test]
+fn test_duplicate_review_id_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "same"),
+        &artist,
+        &Address::generate(&env),
+        &30u32,
+        &make_string(&env, "first"),
+    );
+    let before = client.get_aggregate(&artist);
+
+    let result = client.try_submit_review(
+        &make_bytes(&env, "same"),
+        &artist,
+        &Address::generate(&env),
+        &50u32,
+        &make_string(&env, "overwrite"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::DuplicateReview)));
+    assert_eq!(client.get_aggregate(&artist), before);
+    // The original record is intact.
+    assert_eq!(client.get_review(&make_bytes(&env, "same")).rating_x10, 30);
+}
+
+/// The unique key is per artist: the same client may still review other artists.
+#[test]
+fn test_same_client_can_review_different_artists() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let reviewer = Address::generate(&env);
+    let artist_a = Address::generate(&env);
+    let artist_b = Address::generate(&env);
+
+    client.submit_review(
+        &make_bytes(&env, "a1"),
+        &artist_a,
+        &reviewer,
+        &40u32,
+        &make_string(&env, "a"),
+    );
+    client.submit_review(
+        &make_bytes(&env, "b1"),
+        &artist_b,
+        &reviewer,
+        &20u32,
+        &make_string(&env, "b"),
+    );
+
+    assert_eq!(client.get_score(&artist_a).total_reviews, 1);
+    assert_eq!(client.get_score(&artist_b).total_reviews, 1);
+}
+
+/// Removing a review does not free the key: the same client cannot file a
+/// replacement rating after moderation.
+#[test]
+fn test_removed_review_still_blocks_a_new_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let review_id = make_bytes(&env, "gone");
+    client.submit_review(&review_id, &artist, &reviewer, &10u32, &make_string(&env, "bad"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let result = client.try_submit_review(
+        &make_bytes(&env, "retry"),
+        &artist,
+        &reviewer,
+        &50u32,
+        &make_string(&env, "retry"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::DuplicateReview)));
 }
 
 // ── Review reporting ───────────────────────────────────────────────────────
@@ -290,8 +409,9 @@ fn test_moderation_queue_size_increments() {
     let r1 = make_bytes(&env, "q1");
     let r2 = make_bytes(&env, "q2");
 
+    // Distinct reviewers: `(artist, reviewer)` is the unique review key (#48).
     client.submit_review(&r1, &artist, &reviewer, &30u32, &make_string(&env, "a"));
-    client.submit_review(&r2, &artist, &reviewer, &40u32, &make_string(&env, "b"));
+    client.submit_review(&r2, &artist, &Address::generate(&env), &40u32, &make_string(&env, "b"));
 
     client.report_review(&r1, &reporter, &ReportReason::Spam, &make_string(&env, "x"));
     let reporter2 = Address::generate(&env);
