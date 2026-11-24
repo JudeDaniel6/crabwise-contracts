@@ -1,16 +1,21 @@
 //! Agency roster, revenue split and batch distribution tests (#609).
 
 extern crate std;
-use soroban_sdk::{testutils::Address as _, token, vec, Address, Bytes, Env, String, Vec};
+use soroban_sdk::{
+    testutils::{Address as _, MockAuth, MockAuthInvoke},
+    token, vec, Address, Bytes, Env, IntoVal, String, Vec,
+};
 
 use crate::agency::BatchPayment;
 use crate::errors::AgreementError;
+use crate::types::MilestoneStatus;
 use crate::{CommissionAgreementContract, CommissionAgreementContractClient};
 
 const DEFAULT_SPLIT: u32 = 2_000;
 
 struct Fixture<'a> {
     env: Env,
+    contract_id: Address,
     client_api: CommissionAgreementContractClient<'a>,
     token: Address,
     agency: Address,
@@ -37,6 +42,7 @@ fn setup<'a>() -> Fixture<'a> {
         other_artist: Address::generate(&env),
         commissioner: Address::generate(&env),
         env,
+        contract_id,
         client_api,
         token,
         agency,
@@ -68,6 +74,255 @@ impl Fixture<'_> {
         self.client_api
             .distribute_batch(&self.agency, &self.token, &lines)
     }
+
+    /// An active agreement with two pending milestones, so approving or
+    /// rejecting one leaves the agreement `Active` and the other milestone's
+    /// state untouched.
+    fn agreement_with_pending_milestones(&self) -> (Bytes, Bytes, Bytes) {
+        let commission_id = Bytes::from_slice(&self.env, b"comm-milestone-auth");
+        self.client_api.create_agreement(
+            &commission_id,
+            &self.commissioner,
+            &self.artist,
+            &String::from_str(&self.env, "Cover art"),
+            &10_000,
+            &10_000,
+        );
+        self.client_api.accept_agreement(&commission_id);
+
+        let first = Bytes::from_slice(&self.env, b"m1");
+        let second = Bytes::from_slice(&self.env, b"m2");
+        self.client_api.propose_milestone(
+            &commission_id,
+            &first,
+            &String::from_str(&self.env, "Sketch"),
+            &4_000,
+        );
+        self.client_api.propose_milestone(
+            &commission_id,
+            &second,
+            &String::from_str(&self.env, "Final"),
+            &6_000,
+        );
+        (commission_id, first, second)
+    }
+
+    /// Restrict the mocked auth set to `actor` for one milestone decision, so a
+    /// call by any other identity has no signature to satisfy `require_auth`.
+    fn authorize_only(
+        &self,
+        actor: &Address,
+        fn_name: &str,
+        commission_id: &Bytes,
+        milestone_id: &Bytes,
+    ) {
+        self.env.mock_auths(&[MockAuth {
+            address: actor,
+            invoke: &MockAuthInvoke {
+                contract: &self.contract_id,
+                fn_name,
+                args: (commission_id.clone(), milestone_id.clone()).into_val(&self.env),
+                sub_invokes: &[],
+            },
+        }]);
+    }
+
+    fn milestone_status(&self, commission_id: &Bytes, milestone_id: &Bytes) -> MilestoneStatus {
+        let milestones = self.client_api.get_milestones(commission_id);
+        milestones
+            .iter()
+            .find(|m| &m.milestone_id == milestone_id)
+            .expect("milestone should exist")
+            .status
+    }
+}
+
+/// Asserts that `f` is rejected. Authorization failures surface as host
+/// errors, which abort the invocation rather than returning a typed error.
+fn assert_rejected(f: impl FnOnce()) {
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).is_err(),
+        "an unauthorized milestone decision must be rejected"
+    );
+}
+
+// ── Milestone decision authorization (#36) ─────────────────────────────────
+//
+// One row per (actor, milestone state, decision). Only the client recorded on
+// the agreement may decide a milestone; the artist and an unrelated address
+// must be rejected in every milestone state.
+
+#[test]
+fn client_can_decide_a_pending_milestone() {
+    let f = setup();
+    let (commission_id, first, second) = f.agreement_with_pending_milestones();
+
+    f.client_api.approve_milestone(&commission_id, &first);
+    assert_eq!(
+        f.milestone_status(&commission_id, &first),
+        MilestoneStatus::Approved
+    );
+
+    f.client_api.reject_milestone(&commission_id, &second);
+    assert_eq!(
+        f.milestone_status(&commission_id, &second),
+        MilestoneStatus::Rejected
+    );
+}
+
+#[test]
+fn artist_cannot_decide_a_pending_milestone() {
+    let f = setup();
+    let (commission_id, first, second) = f.agreement_with_pending_milestones();
+
+    for (fn_name, milestone_id) in [
+        ("approve_milestone", first.clone()),
+        ("reject_milestone", second.clone()),
+    ] {
+        f.authorize_only(&f.artist, fn_name, &commission_id, &milestone_id);
+        assert_rejected(|| match fn_name {
+            "approve_milestone" => f
+                .client_api
+                .approve_milestone(&commission_id, &milestone_id),
+            _ => f.client_api.reject_milestone(&commission_id, &milestone_id),
+        });
+        assert_eq!(
+            f.milestone_status(&commission_id, &milestone_id),
+            MilestoneStatus::Pending
+        );
+    }
+}
+
+#[test]
+fn unrelated_address_cannot_decide_a_pending_milestone() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let (commission_id, first, second) = f.agreement_with_pending_milestones();
+
+    for (fn_name, milestone_id) in [
+        ("approve_milestone", first.clone()),
+        ("reject_milestone", second.clone()),
+    ] {
+        f.authorize_only(&stranger, fn_name, &commission_id, &milestone_id);
+        assert_rejected(|| match fn_name {
+            "approve_milestone" => f
+                .client_api
+                .approve_milestone(&commission_id, &milestone_id),
+            _ => f.client_api.reject_milestone(&commission_id, &milestone_id),
+        });
+        assert_eq!(
+            f.milestone_status(&commission_id, &milestone_id),
+            MilestoneStatus::Pending
+        );
+    }
+}
+
+#[test]
+fn artist_cannot_decide_an_already_approved_milestone() {
+    let f = setup();
+    let (commission_id, first, _) = f.agreement_with_pending_milestones();
+    f.client_api.approve_milestone(&commission_id, &first);
+
+    f.authorize_only(&f.artist, "approve_milestone", &commission_id, &first);
+    assert_rejected(|| f.client_api.approve_milestone(&commission_id, &first));
+
+    f.authorize_only(&f.artist, "reject_milestone", &commission_id, &first);
+    assert_rejected(|| f.client_api.reject_milestone(&commission_id, &first));
+
+    assert_eq!(
+        f.milestone_status(&commission_id, &first),
+        MilestoneStatus::Approved
+    );
+}
+
+#[test]
+fn unrelated_address_cannot_decide_an_already_approved_milestone() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let (commission_id, first, _) = f.agreement_with_pending_milestones();
+    f.client_api.approve_milestone(&commission_id, &first);
+
+    f.authorize_only(&stranger, "approve_milestone", &commission_id, &first);
+    assert_rejected(|| f.client_api.approve_milestone(&commission_id, &first));
+
+    f.authorize_only(&stranger, "reject_milestone", &commission_id, &first);
+    assert_rejected(|| f.client_api.reject_milestone(&commission_id, &first));
+
+    assert_eq!(
+        f.milestone_status(&commission_id, &first),
+        MilestoneStatus::Approved
+    );
+}
+
+#[test]
+fn a_client_cannot_change_a_decided_milestone() {
+    let f = setup();
+    let (commission_id, first, second) = f.agreement_with_pending_milestones();
+    f.client_api.approve_milestone(&commission_id, &first);
+    f.client_api.reject_milestone(&commission_id, &second);
+
+    assert_eq!(
+        f.client_api
+            .try_approve_milestone(&commission_id, &first)
+            .err()
+            .unwrap()
+            .unwrap(),
+        AgreementError::InvalidStatus
+    );
+    assert_eq!(
+        f.client_api
+            .try_reject_milestone(&commission_id, &second)
+            .err()
+            .unwrap()
+            .unwrap(),
+        AgreementError::InvalidStatus
+    );
+
+    assert_eq!(
+        f.milestone_status(&commission_id, &first),
+        MilestoneStatus::Approved
+    );
+    assert_eq!(
+        f.milestone_status(&commission_id, &second),
+        MilestoneStatus::Rejected
+    );
+}
+
+#[test]
+fn artist_cannot_decide_an_already_rejected_milestone() {
+    let f = setup();
+    let (commission_id, _, second) = f.agreement_with_pending_milestones();
+    f.client_api.reject_milestone(&commission_id, &second);
+
+    f.authorize_only(&f.artist, "approve_milestone", &commission_id, &second);
+    assert_rejected(|| f.client_api.approve_milestone(&commission_id, &second));
+
+    f.authorize_only(&f.artist, "reject_milestone", &commission_id, &second);
+    assert_rejected(|| f.client_api.reject_milestone(&commission_id, &second));
+
+    assert_eq!(
+        f.milestone_status(&commission_id, &second),
+        MilestoneStatus::Rejected
+    );
+}
+
+#[test]
+fn unrelated_address_cannot_decide_an_already_rejected_milestone() {
+    let f = setup();
+    let stranger = Address::generate(&f.env);
+    let (commission_id, _, second) = f.agreement_with_pending_milestones();
+    f.client_api.reject_milestone(&commission_id, &second);
+
+    f.authorize_only(&stranger, "approve_milestone", &commission_id, &second);
+    assert_rejected(|| f.client_api.approve_milestone(&commission_id, &second));
+
+    f.authorize_only(&stranger, "reject_milestone", &commission_id, &second);
+    assert_rejected(|| f.client_api.reject_milestone(&commission_id, &second));
+
+    assert_eq!(
+        f.milestone_status(&commission_id, &second),
+        MilestoneStatus::Rejected
+    );
 }
 
 #[test]

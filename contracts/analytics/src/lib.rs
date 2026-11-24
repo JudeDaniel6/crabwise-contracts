@@ -20,7 +20,7 @@ mod tests;
 use soroban_sdk::{contract, contractimpl, symbol_short, Address, Bytes, Env, String};
 
 use errors::AnalyticsError;
-use types::{ArtistMetrics, DataKey, EarningsRecord};
+use types::{ArtistMetrics, DataKey, EarningsPage, EarningsPageRequest, EarningsRecord};
 
 /// Ledger TTL for persistent analytics data (~90 days at 6 s/ledger).
 const ANALYTICS_TTL_LEDGERS: u32 = 1_296_000;
@@ -89,6 +89,15 @@ impl AnalyticsContract {
 
         let mut metrics = Self::load_or_default_metrics(&env, &artist);
 
+        // Phase 1 — validate everything that can reject the call, before the
+        // first write (#44). A rejected update therefore changes no aggregate
+        // and leaves no log record behind.
+        let idx: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EarningCount(artist.clone()))
+            .unwrap_or(0u32);
+
         // Update aggregate totals
         metrics.total_earnings = metrics
             .total_earnings
@@ -100,6 +109,9 @@ impl AnalyticsContract {
             .ok_or(AnalyticsError::ArithmeticOverflow)?;
         metrics.last_updated_ledger = env.ledger().sequence();
 
+        // Phase 2 — write. The detailed record and its index are committed
+        // first, so the aggregate below only ever describes a payout that was
+        // actually logged.
         // Persist updated metrics
         Self::save_metrics(&env, &artist, &metrics);
 
@@ -109,6 +121,9 @@ impl AnalyticsContract {
             .persistent()
             .get(&DataKey::EarningCount(artist.clone()))
             .unwrap_or(0u32);
+        // Checked increment (#43): a wrapped index would make the new record
+        // unreachable and let a later payout reuse a live key.
+        let next_idx = idx.checked_add(1).ok_or(AnalyticsError::ArithmeticOverflow)?;
 
         let record = EarningsRecord {
             artist: artist.clone(),
@@ -126,11 +141,16 @@ impl AnalyticsContract {
             .extend_ttl(&DataKey::Earning(artist.clone(), idx), ANALYTICS_TTL_LEDGERS, ANALYTICS_TTL_LEDGERS);
         env.storage()
             .persistent()
-            .set(&DataKey::EarningCount(artist.clone()), &(idx + 1));
+            .set(&DataKey::EarningCount(artist.clone()), &next_idx);
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::EarningCount(artist.clone()), ANALYTICS_TTL_LEDGERS, ANALYTICS_TTL_LEDGERS);
 
+        // Persist updated metrics
+        Self::save_metrics(&env, &artist, &metrics);
+
+        // Phase 3 — announce. The success event is published only after every
+        // write it describes has been applied (#44).
         env.events().publish(
             (symbol_short!("earning"),),
             (artist, commission_id, category, amount),
@@ -242,46 +262,51 @@ impl AnalyticsContract {
 
     /// Return the full [`ArtistMetrics`] aggregate for an artist.
     ///
+    /// `NotFound` means the artist has no metrics record at all (#46); a
+    /// record whose fields disagree with each other is `InvalidMetricData`.
+    ///
     /// Closes #602 – read-back for all metric categories.
     pub fn get_metrics(env: Env, artist: Address) -> Result<ArtistMetrics, AnalyticsError> {
-        env.storage()
-            .persistent()
-            .get(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)
+        Self::load_metrics(&env, &artist)
     }
 
     /// Return the completion rate as a percentage (0–100).
     ///
     /// `completion_rate = completed / (completed + cancelled) * 100`
     ///
-    /// Returns 0 if no commissions have been recorded.
+    /// Returns 0 if the artist has a metrics record but no commissions have
+    /// been recorded — a real zero, distinct from `NotFound` for an artist
+    /// with no record at all (#46).
     ///
     /// Closes #602 – project completion rate tracking.
     pub fn get_completion_rate(env: Env, artist: Address) -> Result<u32, AnalyticsError> {
-        let m = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)?;
+        let m = Self::load_metrics(&env, &artist)?;
 
-        let total = m.completed_count + m.cancelled_count;
+        // Checked arithmetic (#43): a wrapped sum would report a nonsensical
+        // completion rate instead of admitting the aggregate is unreadable.
+        let total = m
+            .completed_count
+            .checked_add(m.cancelled_count)
+            .ok_or(AnalyticsError::ArithmeticOverflow)?;
         if total == 0 {
             return Ok(0);
         }
-        Ok((m.completed_count * 100) / total)
+        let completed_percent = m
+            .completed_count
+            .checked_mul(100)
+            .ok_or(AnalyticsError::ArithmeticOverflow)?;
+        Ok(completed_percent / total)
     }
 
     /// Return the average response time in ledgers (rounded down).
     ///
-    /// Returns 0 if no response times have been recorded.
+    /// Returns 0 if no response times have been recorded — a real zero,
+    /// distinct from `NotFound` for an artist with no metrics record at all
+    /// (#46).
     ///
     /// Closes #602 – response time analytics.
     pub fn get_avg_response_time(env: Env, artist: Address) -> Result<u64, AnalyticsError> {
-        let m = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)?;
+        let m = Self::load_metrics(&env, &artist)?;
 
         if m.response_time_count == 0 {
             return Ok(0);
@@ -291,15 +316,12 @@ impl AnalyticsContract {
 
     /// Return the average satisfaction score × 10 (rounded down).
     ///
-    /// Returns 0 if no scores have been recorded.
+    /// Returns 0 if no scores have been recorded — a real zero, distinct from
+    /// `NotFound` for an artist with no metrics record at all (#46).
     ///
     /// Closes #602 – client satisfaction trends.
     pub fn get_avg_satisfaction(env: Env, artist: Address) -> Result<u32, AnalyticsError> {
-        let m = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)?;
+        let m = Self::load_metrics(&env, &artist)?;
 
         if m.satisfaction_score_count == 0 {
             return Ok(0);
@@ -314,15 +336,13 @@ impl AnalyticsContract {
     /// commission). Callers can project by multiplying this by an expected
     /// number of upcoming commissions.
     ///
-    /// Returns 0 if no earnings have been recorded.
+    /// Returns 0 if the artist has a metrics record but no completed
+    /// commissions — a real zero, distinct from `NotFound` for an artist with
+    /// no record at all (#46).
     ///
     /// Closes #602 – earnings predictions.
     pub fn predict_earnings(env: Env, artist: Address) -> Result<i128, AnalyticsError> {
-        let m = env
-            .storage()
-            .persistent()
-            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist))
-            .ok_or(AnalyticsError::NotFound)?;
+        let m = Self::load_metrics(&env, &artist)?;
 
         if m.completed_count == 0 {
             return Ok(0);
@@ -365,8 +385,75 @@ impl AnalyticsContract {
         from_index: u32,
         limit: u32,
     ) -> Result<soroban_sdk::Vec<EarningsRecord>, AnalyticsError> {
+        Ok(read_earnings_range(&env, &artist, from_index, limit))
+    }
+
+    /// Return one bounded page of earnings history together with its cursor
+    /// (#47).
+    ///
+    /// Unlike [`get_earnings`](Self::get_earnings), the response carries
+    /// `next_index`, which advances by the requested range rather than by the
+    /// number of records returned. A client that has pruned records in the
+    /// range therefore still walks forward without re-reading an overlapping
+    /// page. Reads are clamped to [`MAX_EARNING_PAGE`] just like `get_earnings`.
+    ///
+    /// `from_index` past the end is clamped to `total`, so the last page is
+    /// empty, reports `next_index == total`, and sets `has_more` to false.
+    pub fn get_earnings_page(
+        env: Env,
+        request: EarningsPageRequest,
+    ) -> Result<EarningsPage, AnalyticsError> {
+        let total: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EarningCount(request.artist.clone()))
+            .unwrap_or(0u32);
+
+        let start = request.from_index.min(total);
+        let cap = request.limit.min(MAX_EARNING_PAGE);
+        let end = start.saturating_add(cap).min(total);
+        let records = read_earnings_range(&env, &request.artist, start, end - start);
+
+        Ok(EarningsPage {
+            records,
+            next_index: end,
+            total,
+            has_more: end < total,
+        })
+    }
+
+    /// Return the earnings records inside an inclusive ledger window (#45).
+    ///
+    /// `[from_ledger, to_ledger]` is validated before anything is read: an
+    /// inverted window, or one wider than
+    /// [`types::MAX_QUERY_WINDOW_LEDGERS`], is rejected with
+    /// [`AnalyticsError::InvalidQueryWindow`] rather than silently clamped. A
+    /// valid window that happens to contain no records is not an error — it
+    /// returns an empty vector, so a caller can query a quiet period directly.
+    ///
+    /// Like [`get_earnings`], the scan is bounded: at most
+    /// `min(limit, MAX_EARNING_PAGE)` indexes starting at `from_index` are
+    /// examined, so a caller pages through the log rather than making one
+    /// unbounded call. Records outside the window are skipped, so a page may be
+    /// shorter than `limit`.
+    pub fn get_earnings_in_window(
+        env: Env,
+        artist: Address,
+        from_ledger: u32,
+        to_ledger: u32,
+        from_index: u32,
+        limit: u32,
+    ) -> Result<soroban_sdk::Vec<EarningsRecord>, AnalyticsError> {
+        types::validate_query_window(from_ledger, to_ledger)?;
+
         let cap = limit.min(MAX_EARNING_PAGE);
-        let end = from_index.saturating_add(cap);
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EarningCount(artist.clone()))
+            .unwrap_or(0u32);
+        let end = from_index.saturating_add(cap).min(count);
+
         let mut out: soroban_sdk::Vec<EarningsRecord> = soroban_sdk::Vec::new(&env);
         let mut idx = from_index;
         while idx < end {
@@ -375,7 +462,9 @@ impl AnalyticsContract {
                 .persistent()
                 .get::<DataKey, EarningsRecord>(&DataKey::Earning(artist.clone(), idx))
             {
-                out.push_back(record);
+                if types::in_query_window(record.ledger, from_ledger, to_ledger) {
+                    out.push_back(record);
+                }
             }
             idx = idx.saturating_add(1);
         }
@@ -489,6 +578,32 @@ impl AnalyticsContract {
 
     // ── Internal helpers ───────────────────────────────────────────────────
 
+    /// Load one artist's aggregate, keeping absence, a real zero and corrupt
+    /// data as three distinct answers (#46).
+    ///
+    /// * No record at all → [`AnalyticsError::NotFound`].
+    /// * A record with a zero sample count → a genuine `0` for the derived
+    ///   query, not missing data.
+    /// * A record whose counts and sums disagree (e.g. a maintained sum with a
+    ///   zero sample count) → [`AnalyticsError::InvalidMetricData`], rather
+    ///   than averaging nonsense into a plausible-looking number.
+    fn load_metrics(env: &Env, artist: &Address) -> Result<ArtistMetrics, AnalyticsError> {
+        let m = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ArtistMetrics>(&DataKey::Metrics(artist.clone()))
+            .ok_or(AnalyticsError::NotFound)?;
+
+        let response_time_ok = m.response_time_count != 0 || m.response_time_sum == 0;
+        let satisfaction_ok =
+            m.satisfaction_score_count != 0 || m.satisfaction_score_sum == 0;
+        let earnings_ok = m.completed_count != 0 || m.total_earnings == 0;
+        if !(response_time_ok && satisfaction_ok && earnings_ok) {
+            return Err(AnalyticsError::InvalidMetricData);
+        }
+        Ok(m)
+    }
+
     fn require_admin(env: &Env) -> Result<Address, AnalyticsError> {
         env.storage()
             .instance()
@@ -519,5 +634,141 @@ impl AnalyticsContract {
         env.storage()
             .persistent()
             .extend_ttl(&DataKey::Metrics(artist.clone()), ANALYTICS_TTL_LEDGERS, ANALYTICS_TTL_LEDGERS);
+    }
+}
+
+/// Read at most `MAX_EARNING_PAGE` indexes starting at `from_index`, skipping
+/// indexes whose records have been pruned.
+///
+/// The scan length is bounded by the caller's limit, not by the size of the
+/// log, so a page read cannot become an unbounded history walk.
+fn read_earnings_range(
+    env: &Env,
+    artist: &Address,
+    from_index: u32,
+    limit: u32,
+) -> soroban_sdk::Vec<EarningsRecord> {
+    let cap = limit.min(MAX_EARNING_PAGE);
+    let end = from_index.saturating_add(cap);
+    let mut out: soroban_sdk::Vec<EarningsRecord> = soroban_sdk::Vec::new(env);
+    let mut idx = from_index;
+    while idx < end {
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, EarningsRecord>(&DataKey::Earning(artist.clone(), idx))
+        {
+            out.push_back(record);
+        }
+        idx = idx.saturating_add(1);
+    }
+    out
+}
+
+#[cfg(test)]
+mod page_tests {
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn seeded_client(env: &Env, records: u32) -> (AnalyticsContractClient<'_>, Address) {
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let contract_id = env.register_contract(None, AnalyticsContract);
+        let client = AnalyticsContractClient::new(env, &contract_id);
+        client.initialize(&admin);
+
+        let artist = Address::generate(env);
+        let payer = Address::generate(env);
+        let commission_id = Bytes::from_slice(env, b"commission");
+        let category = String::from_str(env, "ui");
+        for i in 1..=records {
+            client.record_earning(
+                &artist,
+                &commission_id,
+                &category,
+                &payer,
+                &(i as i128),
+            );
+        }
+        (client, artist)
+    }
+
+    #[test]
+    fn pages_are_bounded_and_do_not_overlap() {
+        let env = Env::default();
+        let (client, artist) = seeded_client(&env, 105);
+
+        let mut cursor = 0u32;
+        let mut seen = 0u32;
+        loop {
+            let page = client.get_earnings_page(&EarningsPageRequest {
+                artist: artist.clone(),
+                from_index: cursor,
+                limit: 50,
+            });
+
+            assert!(page.records.len() <= 50, "a page must stay bounded");
+            assert_eq!(page.total, 105);
+            for record in page.records.iter() {
+                seen += 1;
+                assert_eq!(record.amount, seen as i128, "no record may be repeated");
+            }
+
+            assert!(page.next_index >= cursor, "the cursor must move forward");
+            cursor = page.next_index;
+            if !page.has_more {
+                break;
+            }
+            assert!(cursor < page.total);
+        }
+
+        assert_eq!(seen, 105);
+        assert_eq!(cursor, 105);
+    }
+
+    #[test]
+    fn page_limit_is_clamped_to_the_maximum() {
+        let env = Env::default();
+        let (client, artist) = seeded_client(&env, 60);
+
+        let page = client.get_earnings_page(&EarningsPageRequest {
+            artist,
+            from_index: 0,
+            limit: 1_000,
+        });
+        assert_eq!(page.records.len(), MAX_EARNING_PAGE);
+        assert_eq!(page.next_index, MAX_EARNING_PAGE);
+        assert!(page.has_more);
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_is_an_empty_final_page() {
+        let env = Env::default();
+        let (client, artist) = seeded_client(&env, 5);
+
+        let page = client.get_earnings_page(&EarningsPageRequest {
+            artist,
+            from_index: 99,
+            limit: 10,
+        });
+        assert_eq!(page.records.len(), 0);
+        assert_eq!(page.next_index, 5);
+        assert_eq!(page.total, 5);
+        assert!(!page.has_more);
+    }
+
+    #[test]
+    fn a_zero_limit_reads_nothing_and_does_not_advance() {
+        let env = Env::default();
+        let (client, artist) = seeded_client(&env, 3);
+
+        let page = client.get_earnings_page(&EarningsPageRequest {
+            artist,
+            from_index: 0,
+            limit: 0,
+        });
+        assert_eq!(page.records.len(), 0);
+        assert_eq!(page.next_index, 0);
+        assert!(page.has_more);
     }
 }

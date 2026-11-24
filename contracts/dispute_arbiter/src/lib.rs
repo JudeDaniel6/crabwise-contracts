@@ -16,9 +16,14 @@ use types::{DataKey, DisputeRecord, DisputeStatus, EvidenceRecord};
 
 include!("../../semver_types.rs");
 
-/// Longest evidence blob a single submission may carry (#977). Bounded before
-/// it is written, like the resolution note (#765).
-const MAX_EVIDENCE_LEN: u32 = 1024;
+/// Longest evidence blob a single submission may carry (#977, #38).
+///
+/// The boundary is inclusive: a blob of exactly [`MAX_EVIDENCE_LEN`] bytes is
+/// accepted, and one byte more is rejected with
+/// [`DisputeError::EvidenceTooLong`] before any storage write, so an
+/// over-limit submission leaves the dispute untouched. Bounded before it is
+/// written, like the resolution note (#765).
+pub const MAX_EVIDENCE_LEN: u32 = 1024;
 
 #[contract]
 pub struct DisputeArbiter;
@@ -428,6 +433,8 @@ impl DisputeArbiter {
             return Err(DisputeError::NotInitialized);
         }
         submitter.require_auth();
+        // Size boundary first (#38): reject an over-limit blob before the
+        // dispute is even read, so a rejected submission has no side effects.
         if evidence.len() > MAX_EVIDENCE_LEN {
             return Err(DisputeError::EvidenceTooLong);
         }
@@ -463,6 +470,14 @@ impl DisputeArbiter {
             (commission_id, submitter, index),
         );
         Ok(())
+    }
+
+    /// The inclusive maximum evidence size in bytes (#38).
+    ///
+    /// Exposed so a client can enforce the same boundary before it builds a
+    /// submission, instead of discovering the limit from a failed call.
+    pub fn get_max_evidence_len(_env: Env) -> u32 {
+        MAX_EVIDENCE_LEN
     }
 
     /// How many evidence entries a dispute has accumulated.
