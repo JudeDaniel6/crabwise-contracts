@@ -92,6 +92,23 @@ fn configured_appeal_window(env: &Env) -> u32 {
         .unwrap_or(DEFAULT_APPEAL_WINDOW_LEDGERS)
 }
 
+/// Last ledger on which `review` may be appealed (#051).
+///
+/// The window is inclusive: a filing at exactly this ledger is accepted, and
+/// the first ledger after it is rejected. Both the filing path and the
+/// deadline getters use this so the boundary is defined in one place.
+fn appeal_deadline(env: &Env, review: &ReviewRecord) -> u32 {
+    review
+        .created_ledger
+        .saturating_add(configured_appeal_window(env))
+}
+
+/// Whether the appeal window ending at `deadline` is still open at the current
+/// ledger (#051).
+fn appeal_window_open(env: &Env, deadline: u32) -> bool {
+    env.ledger().sequence() <= deadline
+}
+
 #[contract]
 pub struct ReputationContract;
 
@@ -401,11 +418,11 @@ impl ReputationContract {
             return Err(ReputationError::AppealAlreadyExists);
         }
 
-        // #976: filing is bounded by the review's appeal window. The deadline
-        // ledger itself is still inside the window; only a chain that has moved
-        // past it rejects the appeal.
-        let deadline = review.created_ledger.saturating_add(configured_appeal_window(&env));
-        if env.ledger().sequence() > deadline {
+        // #976/#051: filing is bounded by the review's appeal window. The
+        // deadline ledger itself is still inside the window; only a chain that
+        // has moved past it rejects the appeal.
+        let deadline = appeal_deadline(&env, &review);
+        if !appeal_window_open(&env, deadline) {
             return Err(ReputationError::AppealWindowClosed);
         }
 
@@ -583,14 +600,15 @@ impl ReputationContract {
             .persistent()
             .get(&DataKey::Review(review_id))
             .ok_or(ReputationError::ReviewNotFound)?;
-        Ok(review
-            .created_ledger
-            .saturating_add(configured_appeal_window(&env)))
+        Ok(appeal_deadline(&env, &review))
     }
 
-    /// Ledgers left to file an appeal for `review_id`; `0` once the window has
-    /// closed. Lets a client tell a user "you have N ledgers left" instead of
-    /// surfacing the refusal at filing time (#976).
+    /// Ledgers left to file an appeal for `review_id`.
+    ///
+    /// `0` means the current ledger is the final allowed ledger or the window
+    /// has already closed; the inclusive boundary means a filing at `0` still
+    /// succeeds (#051). Lets a client tell a user "you have N ledgers left"
+    /// instead of surfacing the refusal at filing time (#976).
     pub fn ledgers_to_appeal(env: Env, review_id: Bytes) -> Result<u32, ReputationError> {
         let deadline = Self::get_appeal_deadline(env.clone(), review_id)?;
         Ok(deadline.saturating_sub(env.ledger().sequence()))
