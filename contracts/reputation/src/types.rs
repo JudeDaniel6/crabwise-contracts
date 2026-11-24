@@ -44,6 +44,11 @@ pub enum ReportReason {
 }
 
 /// Current state of an appeal filed against a moderation decision.
+///
+/// `Pending` is the only non-terminal state: once an appeal is `Upheld`,
+/// `Denied`, or `Escalated`, this contract accepts no further decision on it
+/// (#52). `resolve_appeal` therefore rejects a repeated or conflicting decision
+/// with `InvalidStatus` and leaves the review's moderation result untouched.
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AppealStatus {
@@ -51,6 +56,24 @@ pub enum AppealStatus {
     Upheld = 1,
     Denied = 2,
     Escalated = 3,
+}
+
+impl AppealStatus {
+    /// Whether a moderation decision has been recorded on the appeal.
+    ///
+    /// An escalated appeal is terminal but not decided: it has left this
+    /// contract for the dispute arbiter, so it can no longer be decided here.
+    pub fn is_decided(self) -> bool {
+        matches!(self, AppealStatus::Upheld | AppealStatus::Denied)
+    }
+
+    /// Whether the appeal can no longer be decided or escalated.
+    ///
+    /// This is the guard `resolve_appeal` relies on: only a `Pending` appeal
+    /// may transition, so a second decision can never overwrite the first.
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, AppealStatus::Pending)
+    }
 }
 
 /// A review submitted by a client about an artist.

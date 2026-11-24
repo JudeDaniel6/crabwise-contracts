@@ -1,10 +1,10 @@
 extern crate std;
 use soroban_sdk::{
-    contract, contractimpl, testutils::{Address as _, Events as _, Ledger as _},
+    contract, contractimpl, symbol_short, testutils::{Address as _, Events as _, Ledger as _},
     Address, Bytes, Env, String, IntoVal,
 };
 
-use crate::errors::DisputeError;
+use crate::errors::{get_suggestion, DisputeError};
 use crate::types::{DisputeRecord, DisputeStatus};
 use crate::{DisputeArbiter, DisputeArbiterClient};
 
@@ -154,7 +154,6 @@ fn test_resolve_for_client_not_found_fails() {
 }
 
 #[test]
-#[ignore = "requires a live escrow contract"]
 fn test_resolve_for_client_wrong_status_fails() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
@@ -200,7 +199,6 @@ fn test_resolve_for_artist_not_found_fails() {
 }
 
 #[test]
-#[ignore = "requires a live escrow contract"]
 fn test_resolve_for_artist_wrong_status_fails() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
@@ -274,7 +272,6 @@ fn test_partial_resolve_not_found_fails() {
 }
 
 #[test]
-#[ignore = "requires a live escrow contract"]
 fn test_partial_resolve_wrong_status_fails() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
@@ -348,7 +345,6 @@ fn test_auto_resolve_not_found_fails() {
 }
 
 #[test]
-#[ignore = "requires a live escrow contract"]
 fn test_auto_resolve_wrong_status_fails() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
@@ -410,6 +406,150 @@ fn test_error_codes() {
     assert_eq!(DisputeError::EvidenceWindowClosed as u32, 11);
     assert_eq!(DisputeError::EvidenceTooLong as u32, 12);
     assert_eq!(DisputeError::InvalidTtl as u32, 13);
+}
+
+// ========== invalid resolution outcomes (#42) ==========
+
+/// An initialized arbiter with one open dispute, so the resolution entry
+/// points can be driven with deliberately invalid outcome values.
+fn open_dispute_fixture(env: &Env) -> (DisputeArbiterClient<'_>, Bytes) {
+    let admin = Address::generate(env);
+    let escrow = env.register_contract(None, MockEscrow);
+    let config = env.register_contract(None, MockConfig);
+    env.mock_all_auths();
+    let arbiter = env.register_contract(None, DisputeArbiter);
+    let client = DisputeArbiterClient::new(env, &arbiter);
+    client.initialize(&admin, &escrow, &config, &100u32);
+    let commission_id = Bytes::from_array(env, &[1u8, 2, 3]);
+    client.open_dispute(&commission_id, &Address::generate(env));
+    (client, commission_id)
+}
+
+#[test]
+fn test_out_of_range_outcome_share_is_rejected() {
+    let env = Env::default();
+    let (client, commission_id) = open_dispute_fixture(&env);
+    let note = String::from_str(&env, "split");
+    let events_before = env.events().all().len();
+
+    // Any split that would hand the client more than 100 % is not an outcome
+    // the contract can pay out.
+    for bad_share in [10_001u32, u32::MAX] {
+        let result = client.try_partial_resolve(&commission_id, &bad_share, &note);
+        assert_eq!(result.unwrap_err().unwrap(), DisputeError::InvalidShareBps);
+    }
+
+    // A rejected outcome records nothing and emits no success event.
+    assert_eq!(
+        client.get_dispute(&commission_id).status,
+        DisputeStatus::Open
+    );
+    assert_eq!(env.events().all().len(), events_before);
+}
+
+#[test]
+fn test_oversized_outcome_note_is_rejected_by_every_resolution() {
+    let env = Env::default();
+    let (client, commission_id) = open_dispute_fixture(&env);
+    let too_long = "x".repeat((shared::validation::MAX_MEMO_LEN + 1) as usize);
+    let note = String::from_str(&env, &too_long);
+    let events_before = env.events().all().len();
+
+    let client_result = client.try_resolve_for_client(&commission_id, &note);
+    assert_eq!(
+        client_result.unwrap_err().unwrap(),
+        DisputeError::NoteTooLong
+    );
+    let artist_result = client.try_resolve_for_artist(&commission_id, &note);
+    assert_eq!(
+        artist_result.unwrap_err().unwrap(),
+        DisputeError::NoteTooLong
+    );
+    let split_result = client.try_partial_resolve(&commission_id, &4_000u32, &note);
+    assert_eq!(
+        split_result.unwrap_err().unwrap(),
+        DisputeError::NoteTooLong
+    );
+
+    assert_eq!(
+        client.get_dispute(&commission_id).status,
+        DisputeStatus::Open
+    );
+    assert_eq!(env.events().all().len(), events_before);
+}
+
+#[test]
+fn test_outcome_note_at_the_limit_is_accepted() {
+    let env = Env::default();
+    let (client, commission_id) = open_dispute_fixture(&env);
+    let at_limit = "x".repeat(shared::validation::MAX_MEMO_LEN as usize);
+
+    // The same limit that rejects an oversized note must accept one exactly at
+    // the bound — the check is a bound, not a blanket refusal.
+    client.resolve_for_client(&commission_id, &String::from_str(&env, &at_limit));
+    assert_eq!(
+        client.get_dispute(&commission_id).status,
+        DisputeStatus::ResolvedForClient
+    );
+}
+
+#[test]
+fn test_outcome_on_a_settled_dispute_is_rejected() {
+    let env = Env::default();
+    let (client, commission_id) = open_dispute_fixture(&env);
+    client.resolve_for_client(&commission_id, &String::from_str(&env, "done"));
+
+    // Once an outcome is recorded, every later outcome is rejected as an
+    // invalid status rather than silently overwriting the settlement.
+    let note = String::from_str(&env, "again");
+    let client_result = client.try_resolve_for_client(&commission_id, &note);
+    assert_eq!(
+        client_result.unwrap_err().unwrap(),
+        DisputeError::InvalidStatus
+    );
+    let artist_result = client.try_resolve_for_artist(&commission_id, &note);
+    assert_eq!(
+        artist_result.unwrap_err().unwrap(),
+        DisputeError::InvalidStatus
+    );
+    let split_result = client.try_partial_resolve(&commission_id, &5_000u32, &note);
+    assert_eq!(
+        split_result.unwrap_err().unwrap(),
+        DisputeError::InvalidStatus
+    );
+    assert_eq!(
+        client.get_dispute(&commission_id).status,
+        DisputeStatus::ResolvedForClient
+    );
+}
+
+#[test]
+fn test_outcome_validation_codes_and_suggestions_are_stable() {
+    // Codes are permanent (docs/UPGRADE_AND_ROLLBACK.md) and each rejection is
+    // mapped to its own machine-readable suggestion for clients.
+    assert_eq!(DisputeError::InvalidStatus as u32, 5);
+    assert_eq!(DisputeError::InvalidShareBps as u32, 8);
+    assert_eq!(DisputeError::NoteTooLong as u32, 10);
+
+    assert_eq!(
+        get_suggestion(DisputeError::InvalidStatus),
+        symbol_short!("BAD_STS")
+    );
+    assert_eq!(
+        get_suggestion(DisputeError::InvalidShareBps),
+        symbol_short!("BAD_BPS")
+    );
+    assert_eq!(
+        get_suggestion(DisputeError::NoteTooLong),
+        symbol_short!("LONG_NOTE")
+    );
+
+    // The display message tells the caller what to fix, not just that the
+    // outcome was refused.
+    assert_eq!(
+        std::format!("{}", DisputeError::InvalidShareBps),
+        "invalid outcome: client share must be between 0 and 10000 bps"
+    );
 }
 
 // ========== dispute status values ==========

@@ -8,6 +8,7 @@ use soroban_sdk::{
 use crate::{
     ReputationContract, ReputationContractClient,
     errors::ReputationError,
+    score::{MAX_RATING_X10, MIN_RATING_X10},
     types::{
         AppealStatus, ReportReason, ReviewStatus, DEFAULT_APPEAL_WINDOW_LEDGERS,
         MAX_APPEAL_WINDOW_LEDGERS, MAX_QUEUE_SIZE,
@@ -412,6 +413,114 @@ fn test_escalate_appeal() {
     assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Escalated);
 }
 
+/// A review that moderation has `Removed`, with a `Pending` appeal against it.
+fn removed_review_with_appeal(
+    env: &Env,
+    client: &ReputationContractClient<'_>,
+    suffix: &str,
+    rating_x10: u32,
+) -> (Address, Bytes) {
+    let artist = Address::generate(env);
+    let reviewer = Address::generate(env);
+    let reporter = Address::generate(env);
+    let review_id = make_bytes(env, suffix);
+
+    client.submit_review(
+        &review_id,
+        &artist,
+        &reviewer,
+        &rating_x10,
+        &make_string(env, "review"),
+    );
+    client.report_review(
+        &review_id,
+        &reporter,
+        &ReportReason::Spam,
+        &make_string(env, "report"),
+    );
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(env, "removed"));
+    client.file_appeal(&review_id, &artist, &make_string(env, "appeal"));
+
+    (artist, review_id)
+}
+
+#[test]
+fn test_appeal_status_terminal_model() {
+    assert!(!AppealStatus::Pending.is_terminal());
+    assert!(!AppealStatus::Pending.is_decided());
+
+    assert!(AppealStatus::Upheld.is_terminal());
+    assert!(AppealStatus::Upheld.is_decided());
+
+    assert!(AppealStatus::Denied.is_terminal());
+    assert!(AppealStatus::Denied.is_decided());
+
+    // Escalated is terminal for this contract but carries no decision: the
+    // appeal belongs to the dispute arbiter from that point on.
+    assert!(AppealStatus::Escalated.is_terminal());
+    assert!(!AppealStatus::Escalated.is_decided());
+}
+
+#[test]
+fn test_repeated_upheld_decision_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "dup-upheld", 40);
+    client.resolve_appeal(&review_id, &AppealStatus::Upheld);
+    let score_after_decision = client.get_score(&artist);
+
+    let result = client.try_resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+
+    // The first decision stands, and the review is not reinstated twice.
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Upheld);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Active);
+    assert_eq!(client.get_score(&artist), score_after_decision);
+}
+
+#[test]
+fn test_conflicting_decision_after_denial_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "conflict", 40);
+    client.resolve_appeal(&review_id, &AppealStatus::Denied);
+    let score_after_decision = client.get_score(&artist);
+    assert_eq!(score_after_decision.active_reviews, 0);
+    assert_eq!(score_after_decision.removed_reviews, 1);
+
+    // A later `Upheld` must not overturn the denial.
+    let result = client.try_resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Denied);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Removed);
+    assert_eq!(client.get_score(&artist), score_after_decision);
+}
+
+#[test]
+fn test_no_decision_is_allowed_after_escalation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "escalated", 30);
+    client.escalate_appeal(&review_id, &artist);
+    let score_after_escalation = client.get_score(&artist);
+
+    for decision in [AppealStatus::Upheld, AppealStatus::Denied] {
+        let result = client.try_resolve_appeal(&review_id, &decision);
+        assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+    }
+
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Escalated);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Removed);
+    assert_eq!(client.get_score(&artist), score_after_escalation);
+}
+
 #[test]
 fn test_third_party_cannot_file_appeal() {
     let env = Env::default();
@@ -463,6 +572,111 @@ fn test_score_reflects_submitted_reviews() {
     assert_eq!(score.average_rating_x10, 40);
     assert_eq!(score.removed_reviews, 0);
     assert_eq!(score.appeal_count, 0);
+}
+
+#[test]
+fn test_score_at_the_lowest_accepted_rating() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "low"),
+        &artist,
+        &Address::generate(&env),
+        &MIN_RATING_X10,
+        &make_string(&env, "lowest accepted"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 1);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.rating_sum, MIN_RATING_X10);
+    assert_eq!(score.average_rating_x10, MIN_RATING_X10);
+    // (10 + 30*3) / (1 + 3) = 100 / 4 = 25.
+    assert_eq!(score.weighted_score_x10, 25);
+}
+
+#[test]
+fn test_score_at_the_highest_accepted_rating() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "high"),
+        &artist,
+        &Address::generate(&env),
+        &MAX_RATING_X10,
+        &make_string(&env, "highest accepted"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 1);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.rating_sum, MAX_RATING_X10);
+    assert_eq!(score.average_rating_x10, MAX_RATING_X10);
+    // (50 + 30*3) / (1 + 3) = 140 / 4 = 35.
+    assert_eq!(score.weighted_score_x10, 35);
+}
+
+#[test]
+fn test_score_mixes_the_lowest_and_highest_ratings() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.submit_review(
+        &make_bytes(&env, "mix-low"),
+        &artist,
+        &Address::generate(&env),
+        &MIN_RATING_X10,
+        &make_string(&env, "low"),
+    );
+    client.submit_review(
+        &make_bytes(&env, "mix-high"),
+        &artist,
+        &Address::generate(&env),
+        &MAX_RATING_X10,
+        &make_string(&env, "high"),
+    );
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 2);
+    assert_eq!(score.active_reviews, 2);
+    assert_eq!(score.rating_sum, MIN_RATING_X10 + MAX_RATING_X10);
+    assert_eq!(score.average_rating_x10, 30);
+    // (60 + 90) / (2 + 3) = 150 / 5 = 30.
+    assert_eq!(score.weighted_score_x10, 30);
+}
+
+#[test]
+fn test_score_stays_consistent_after_removing_a_review() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let low_id = make_bytes(&env, "rm-low");
+    let high_id = make_bytes(&env, "rm-high");
+    client.submit_review(&low_id, &artist, &Address::generate(&env), &MIN_RATING_X10, &make_string(&env, "low"));
+    client.submit_review(&high_id, &artist, &Address::generate(&env), &MAX_RATING_X10, &make_string(&env, "high"));
+
+    // Remove only the highest-rated review.
+    client.report_review(&high_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&high_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    let score = client.get_score(&artist);
+    assert_eq!(score.total_reviews, 2);
+    assert_eq!(score.active_reviews, 1);
+    assert_eq!(score.removed_reviews, 1);
+    assert_eq!(score.rating_sum, MIN_RATING_X10);
+    assert_eq!(score.average_rating_x10, MIN_RATING_X10);
+    // Back to a single lowest-rated review: (10 + 90) / 4 = 25.
+    assert_eq!(score.weighted_score_x10, 25);
 }
 
 #[test]

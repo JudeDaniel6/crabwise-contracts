@@ -7,67 +7,36 @@
 
 #![cfg(test)]
 
-use soroban_sdk::{Address, Bytes, Env, String};
+use soroban_sdk::{
+    symbol_short,
+    testutils::{Address as _, Events, Ledger},
+    Address, Bytes, Env, IntoVal, String, Symbol,
+};
+use crate::cancellation::CancellationReason;
 use crate::types::{AgreementStatus, MilestoneStatus};
 use crate::errors::AgreementError;
-use crate::CommissionAgreementContract;
+use crate::{CommissionAgreementContract, CommissionAgreementContractClient};
 
-// Helper: register contract and return (env, client_addr, artist_addr, contract_client)
-fn setup() -> (Env, Address, Address, soroban_sdk::contractclient::ContractClient<'static, CommissionAgreementContract>) {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
-    let client_addr = Address::generate(&env);
-    let artist_addr = Address::generate(&env);
-    let contract_id = env.register_contract(None, CommissionAgreementContract);
-    let client = CommissionAgreementContractClient::new(&env, &contract_id);
-    (env, client_addr, artist_addr, client)
-}
-
-
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum AgreementError {
-    AlreadyExists = 1,
-    NotFound = 2,
-    InvalidStatus = 3,
-    Unauthorized = 4,
-    InvalidAmount = 5,
-    DeadlineInPast = 6,
-    MilestoneBudgetExceeded = 7,
-    NotAllMilestonesApproved = 8,
-}
-
-impl core::fmt::Display for AgreementError {
-    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        match self {
-            Self::AlreadyExists => write!(f, "agreement already exists"),
-            Self::NotFound => write!(f, "agreement not found"),
-            Self::InvalidStatus => write!(f, "invalid status"),
-            Self::Unauthorized => write!(f, "unauthorized"),
-            Self::InvalidAmount => write!(f, "invalid amount"),
-            Self::DeadlineInPast => write!(f, "deadline in past"),
-            Self::MilestoneBudgetExceeded => write!(f, "milestone budget exceeded"),
-            Self::NotAllMilestonesApproved => write!(f, "not all milestones approved"),
+/// Read the canonical lifecycle event published by the call under test.
+///
+/// `from` is the event count observed before that call, so only the transition
+/// being asserted is inspected. Returns its `(commission_id, status)` payload
+/// after checking the call published exactly one `agr_sts` event (#37).
+fn status_event_since(env: &Env, from: u32) -> (Bytes, AgreementStatus) {
+    let events = env.events().all();
+    let mut found = None;
+    let mut count = 0u32;
+    for i in from..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        let topic: Symbol = topics.get(0).unwrap().into_val(env);
+        if topic == symbol_short!("agr_sts") {
+            count += 1;
+            found = Some(data.into_val(env));
         }
     }
+    assert_eq!(count, 1, "a transition must publish exactly one agr_sts event");
+    found.expect("call must publish an agr_sts lifecycle event")
 }
-
-pub fn get_suggestion(error: AgreementError) -> Symbol {
-    match error {
-        AgreementError::AlreadyExists => symbol_short!("DUP"),
-        AgreementError::NotFound => symbol_short!("NOT_FOUND"),
-        AgreementError::InvalidStatus => symbol_short!("BAD_STATUS"),
-        AgreementError::Unauthorized => symbol_short!("AUTH"),
-        AgreementError::InvalidAmount => symbol_short!("BAD_AMT"),
-        AgreementError::DeadlineInPast => symbol_short!("PAST_DDL"),
-        AgreementError::MilestoneBudgetExceeded => symbol_short!("OVER_BUD"),
-        AgreementError::NotAllMilestonesApproved => symbol_short!("NOT_ALL"),
-    }
-}
-
 
 // ── #494 – Unauthorized call tests ─────────────────────────────────────────
 
@@ -102,7 +71,7 @@ fn test_unauthorized_propose_milestone_no_agreement() {
 fn test_unauthorized_approve_nonexistent_milestone() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
     let contract_id = env.register_contract(None, CommissionAgreementContract);
@@ -134,7 +103,7 @@ fn test_unauthorized_reject_nonexistent_agreement() {
 fn test_unauthorized_deadline_in_past() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 200; });
+    env.ledger().set_sequence_number(200);
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
     let contract_id = env.register_contract(None, CommissionAgreementContract);
@@ -152,7 +121,7 @@ fn test_unauthorized_deadline_in_past() {
 fn test_edge_case_zero_budget_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
     let contract_id = env.register_contract(None, CommissionAgreementContract);
@@ -168,7 +137,7 @@ fn test_edge_case_zero_budget_rejected() {
 fn test_edge_case_negative_budget_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
     let contract_id = env.register_contract(None, CommissionAgreementContract);
@@ -184,7 +153,7 @@ fn test_edge_case_negative_budget_rejected() {
 fn test_edge_case_large_budget_accepted() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
     let contract_id = env.register_contract(None, CommissionAgreementContract);
@@ -201,7 +170,7 @@ fn test_edge_case_large_budget_accepted() {
 fn test_edge_case_zero_milestone_amount_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
     let contract_id = env.register_contract(None, CommissionAgreementContract);
@@ -220,7 +189,7 @@ fn test_edge_case_zero_milestone_amount_rejected() {
 fn test_edge_case_duplicate_commission_id_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
     let contract_id = env.register_contract(None, CommissionAgreementContract);
@@ -239,7 +208,7 @@ fn test_edge_case_duplicate_commission_id_rejected() {
 fn test_full_commission_lifecycle() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
 
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
@@ -282,7 +251,7 @@ fn test_full_commission_lifecycle() {
 fn test_lifecycle_create_then_reject() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
 
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
@@ -305,7 +274,7 @@ fn test_lifecycle_create_then_reject() {
 fn test_lifecycle_double_accept_fails() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
 
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
@@ -326,7 +295,7 @@ fn test_lifecycle_double_accept_fails() {
 fn test_lifecycle_multiple_milestones() {
     let env = Env::default();
     env.mock_all_auths();
-    env.ledger().with_mut(|li| { li.sequence = 10; });
+    env.ledger().set_sequence_number(10);
 
     let client_addr = Address::generate(&env);
     let artist_addr = Address::generate(&env);
@@ -354,6 +323,116 @@ fn test_lifecycle_multiple_milestones() {
     let milestones = client.get_milestones(&commission_id);
     let approved_count = milestones.iter().filter(|m| m.status == MilestoneStatus::Approved).count();
     assert_eq!(approved_count, 1);
+}
+
+// ── #37 – Lifecycle events match the persisted status ──────────────────────
+
+/// Accepting publishes `agr_sts` with the status that is stored afterwards.
+#[test]
+fn test_lifecycle_event_on_accept_reflects_persisted_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(10);
+
+    let client_addr = Address::generate(&env);
+    let artist_addr = Address::generate(&env);
+    let contract_id = env.register_contract(None, CommissionAgreementContract);
+    let client = CommissionAgreementContractClient::new(&env, &contract_id);
+
+    let commission_id = Bytes::from_array(&env, &[11]);
+    let title = String::from_str(&env, "Accepted work");
+    client.create_agreement(&commission_id, &client_addr, &artist_addr, &title, &1_000i128, &100u32);
+    client.accept_agreement(&commission_id);
+
+    let (event_id, event_status) = status_event_since(&env, 0);
+    assert_eq!(event_id, commission_id);
+    assert_eq!(event_status, AgreementStatus::Active);
+    assert_eq!(client.get_agreement(&commission_id).status, event_status);
+}
+
+/// Rejection persists `Cancelled` and the event carries that same status.
+#[test]
+fn test_lifecycle_event_on_reject_reflects_persisted_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(10);
+
+    let client_addr = Address::generate(&env);
+    let artist_addr = Address::generate(&env);
+    let contract_id = env.register_contract(None, CommissionAgreementContract);
+    let client = CommissionAgreementContractClient::new(&env, &contract_id);
+
+    let commission_id = Bytes::from_array(&env, &[12]);
+    let title = String::from_str(&env, "Rejected work");
+    client.create_agreement(&commission_id, &client_addr, &artist_addr, &title, &1_000i128, &100u32);
+    client.reject_agreement(&commission_id, &String::from_str(&env, "Not a fit"));
+
+    let (event_id, event_status) = status_event_since(&env, 0);
+    assert_eq!(event_id, commission_id);
+    assert_eq!(event_status, AgreementStatus::Cancelled);
+    assert_eq!(client.get_agreement(&commission_id).status, AgreementStatus::Cancelled);
+}
+
+/// Cancellation publishes the settled `Cancelled` status, not the status the
+/// agreement had before the call.
+#[test]
+fn test_lifecycle_event_on_cancel_reflects_persisted_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(10);
+
+    let client_addr = Address::generate(&env);
+    let artist_addr = Address::generate(&env);
+    let contract_id = env.register_contract(None, CommissionAgreementContract);
+    let client = CommissionAgreementContractClient::new(&env, &contract_id);
+
+    let commission_id = Bytes::from_array(&env, &[13]);
+    let title = String::from_str(&env, "Cancelled work");
+    client.create_agreement(&commission_id, &client_addr, &artist_addr, &title, &1_000i128, &100u32);
+    client.accept_agreement(&commission_id);
+    let before = env.events().all().len();
+    client.cancel_agreement(&commission_id, &client_addr, &CancellationReason::ClientRequest);
+
+    let (event_id, event_status) = status_event_since(&env, before);
+    assert_eq!(event_id, commission_id);
+    assert_eq!(event_status, AgreementStatus::Cancelled);
+    assert_eq!(client.get_agreement(&commission_id).status, AgreementStatus::Cancelled);
+    // The settled cancellation record survives alongside the status change.
+    assert_eq!(client.get_cancellation(&commission_id).initiator, client_addr);
+}
+
+/// Approving the last outstanding milestone completes the agreement, and the
+/// completion event reports `Completed`.
+#[test]
+fn test_lifecycle_event_on_completion_reflects_persisted_status() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_sequence_number(10);
+
+    let client_addr = Address::generate(&env);
+    let artist_addr = Address::generate(&env);
+    let contract_id = env.register_contract(None, CommissionAgreementContract);
+    let client = CommissionAgreementContractClient::new(&env, &contract_id);
+
+    let commission_id = Bytes::from_array(&env, &[14]);
+    let title = String::from_str(&env, "Finished work");
+    let m1 = Bytes::from_array(&env, &[1]);
+    let m2 = Bytes::from_array(&env, &[2]);
+    client.create_agreement(&commission_id, &client_addr, &artist_addr, &title, &9_000i128, &300u32);
+    client.accept_agreement(&commission_id);
+    client.propose_milestone(&commission_id, &m1, &String::from_str(&env, "Phase 1"), &4_000i128);
+    client.propose_milestone(&commission_id, &m2, &String::from_str(&env, "Phase 2"), &5_000i128);
+
+    client.approve_milestone(&commission_id, &m1);
+    // Still Active: one milestone remains.
+    assert_eq!(client.get_agreement(&commission_id).status, AgreementStatus::Active);
+
+    let before = env.events().all().len();
+    client.approve_milestone(&commission_id, &m2);
+    let (event_id, event_status) = status_event_since(&env, before);
+    assert_eq!(event_id, commission_id);
+    assert_eq!(event_status, AgreementStatus::Completed);
+    assert_eq!(client.get_agreement(&commission_id).status, AgreementStatus::Completed);
 }
 
 // ── #497 – Dispute and auto-resolve integration test ───────────────────────

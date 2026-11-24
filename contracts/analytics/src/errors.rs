@@ -13,6 +13,10 @@ pub enum AnalyticsError {
     /// An argument value is out of the accepted range.
     InvalidAmount = 4,
     /// No metrics found for the given artist.
+    ///
+    /// This is the *absence* representation (#46): the artist has no metrics
+    /// record at all. It is deliberately distinct from a real zero, which is
+    /// reported as `Ok(0)` from the derived queries once a record exists.
     NotFound = 5,
     /// An arithmetic operation would overflow.
     ArithmeticOverflow = 6,
@@ -21,6 +25,12 @@ pub enum AnalyticsError {
     /// A query window is inverted or wider than
     /// [`MAX_QUERY_WINDOW_LEDGERS`](crate::types::MAX_QUERY_WINDOW_LEDGERS).
     InvalidQueryWindow = 8,
+    /// The stored aggregate is internally inconsistent — a sum with a zero
+    /// sample count — so no metric value can be derived from it (#46).
+    ///
+    /// Distinct from [`Self::NotFound`], which means there is no record at
+    /// all, and from a genuine zero sample value.
+    InvalidMetricData = 8,
 }
 
 impl core::fmt::Display for AnalyticsError {
@@ -36,6 +46,7 @@ impl core::fmt::Display for AnalyticsError {
             Self::InvalidQueryWindow => {
                 write!(f, "query window is inverted or exceeds the maximum span")
             }
+            Self::InvalidMetricData => write!(f, "stored metric data is inconsistent"),
         }
     }
 }
@@ -51,5 +62,6 @@ pub fn get_suggestion(error: AnalyticsError) -> Symbol {
         AnalyticsError::ArithmeticOverflow => symbol_short!("OVERFL"),
         AnalyticsError::InvalidScore => symbol_short!("BAD_SCR"),
         AnalyticsError::InvalidQueryWindow => symbol_short!("BAD_WIN"),
+        AnalyticsError::InvalidMetricData => symbol_short!("BAD_DATA"),
     }
 }
