@@ -2,7 +2,7 @@ extern crate std;
 use std::format;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Address, Bytes, Env, String,
 };
 
@@ -518,4 +518,157 @@ fn test_prune_earnings_stops_at_a_protected_record() {
     // The in-window record survives.
     assert!(client.try_get_earning(&artist, &2).is_ok());
     assert_eq!(client.get_earning_count(&artist), 3);
+}
+
+// ── Atomicity of metric updates and events (#44) ─────────────────────────
+
+fn event_count(env: &Env) -> u32 {
+    env.events().all().len()
+}
+
+#[test]
+fn test_rejected_earning_leaves_no_aggregate_or_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let events_before = event_count(&env);
+
+    // A non-positive payout is refused before anything is written or
+    // announced.
+    let result = client.try_record_earning(
+        &artist,
+        &make_bytes(&env, "c1"),
+        &make_string(&env, "ui"),
+        &Address::generate(&env),
+        &0,
+    );
+    assert_eq!(result, Err(Ok(AnalyticsError::InvalidAmount)));
+
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+    assert_eq!(client.get_earning_count(&artist), 0);
+    assert_eq!(
+        event_count(&env),
+        events_before,
+        "a rejected update must not emit a success event"
+    );
+}
+
+#[test]
+fn test_earning_overflow_keeps_prior_aggregate_and_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let cat = make_string(&env, "ui");
+
+    client.record_earning(
+        &artist,
+        &make_bytes(&env, "max"),
+        &cat,
+        &client_addr,
+        &i128::MAX,
+    );
+    let metrics_before = client.get_metrics(&artist);
+    let events_before = event_count(&env);
+
+    let result = client.try_record_earning(
+        &artist,
+        &make_bytes(&env, "over"),
+        &cat,
+        &client_addr,
+        &1,
+    );
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+
+    // The single earlier payout is untouched and the failure adds no event.
+    assert_eq!(client.get_metrics(&artist), metrics_before);
+    assert_eq!(client.get_earning_count(&artist), 1);
+    assert_eq!(event_count(&env), events_before);
+}
+
+#[test]
+fn test_rejected_response_time_leaves_no_aggregate_or_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let events_before = event_count(&env);
+
+    let result = client.try_record_response_time(&artist, &0u64);
+    assert_eq!(result, Err(Ok(AnalyticsError::InvalidAmount)));
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+    assert_eq!(event_count(&env), events_before);
+}
+
+#[test]
+fn test_response_time_overflow_keeps_prior_aggregate_and_events() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.record_response_time(&artist, &u64::MAX);
+    let metrics_before = client.get_metrics(&artist);
+    let events_before = event_count(&env);
+
+    let result = client.try_record_response_time(&artist, &1u64);
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+    assert_eq!(client.get_metrics(&artist), metrics_before);
+    assert_eq!(event_count(&env), events_before);
+}
+
+#[test]
+fn test_rejected_satisfaction_leaves_no_aggregate_or_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let events_before = event_count(&env);
+
+    // Both ends of the invalid range: too low and too high.
+    for bad_score in [5u32, 55u32] {
+        let result = client.try_record_satisfaction(&artist, &bad_score);
+        assert_eq!(result, Err(Ok(AnalyticsError::InvalidScore)));
+    }
+
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+    assert_eq!(event_count(&env), events_before);
+}
+
+#[test]
+fn test_successful_update_emits_exactly_one_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let events_before = event_count(&env);
+
+    client.record_earning(
+        &artist,
+        &make_bytes(&env, "c1"),
+        &make_string(&env, "ui"),
+        &Address::generate(&env),
+        &1_000,
+    );
+
+    // Validation, writes and event publication stay paired: one accepted
+    // update, one announcement.
+    assert_eq!(event_count(&env), events_before + 1);
+    assert_eq!(client.get_metrics(&artist).total_earnings, 1_000);
 }

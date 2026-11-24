@@ -89,6 +89,15 @@ impl AnalyticsContract {
 
         let mut metrics = Self::load_or_default_metrics(&env, &artist);
 
+        // Phase 1 — validate everything that can reject the call, before the
+        // first write (#44). A rejected update therefore changes no aggregate
+        // and leaves no log record behind.
+        let idx: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EarningCount(artist.clone()))
+            .unwrap_or(0u32);
+
         // Update aggregate totals
         metrics.total_earnings = metrics
             .total_earnings
@@ -100,16 +109,9 @@ impl AnalyticsContract {
             .ok_or(AnalyticsError::ArithmeticOverflow)?;
         metrics.last_updated_ledger = env.ledger().sequence();
 
-        // Persist updated metrics
-        Self::save_metrics(&env, &artist, &metrics);
-
-        // Append detailed earning record
-        let idx: u32 = env
-            .storage()
-            .persistent()
-            .get(&DataKey::EarningCount(artist.clone()))
-            .unwrap_or(0u32);
-
+        // Phase 2 — write. The detailed record and its index are committed
+        // first, so the aggregate below only ever describes a payout that was
+        // actually logged.
         let record = EarningsRecord {
             artist: artist.clone(),
             commission_id: commission_id.clone(),
@@ -131,6 +133,11 @@ impl AnalyticsContract {
             .persistent()
             .extend_ttl(&DataKey::EarningCount(artist.clone()), ANALYTICS_TTL_LEDGERS, ANALYTICS_TTL_LEDGERS);
 
+        // Persist updated metrics
+        Self::save_metrics(&env, &artist, &metrics);
+
+        // Phase 3 — announce. The success event is published only after every
+        // write it describes has been applied (#44).
         env.events().publish(
             (symbol_short!("earning"),),
             (artist, commission_id, category, amount),
