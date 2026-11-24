@@ -315,6 +315,81 @@ fn test_report_review_increments_count() {
 }
 
 #[test]
+fn test_duplicate_reporter_is_rejected_without_adding_a_report() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let review_id = make_bytes(&env, "dup-reporter");
+
+    client.submit_review(&review_id, &artist, &reviewer, &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &reporter, &ReportReason::Spam, &make_string(&env, "first"));
+
+    // The first report moved the review to UnderReview; a second report from
+    // the same address is rejected as a duplicate before the status check, and
+    // must not consume a report slot.
+    let result = client.try_report_review(
+        &review_id,
+        &reporter,
+        &ReportReason::Abuse,
+        &make_string(&env, "second"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::AlreadyReported)));
+    assert_eq!(client.get_report_count(&review_id), 1);
+}
+
+#[test]
+fn test_new_report_after_prior_report_is_dismissed_is_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let reporter1 = Address::generate(&env);
+    let reporter2 = Address::generate(&env);
+    let review_id = make_bytes(&env, "dismissed");
+
+    client.submit_review(&review_id, &artist, &reviewer, &40u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &reporter1, &ReportReason::Spam, &make_string(&env, "spam"));
+    client.moderate_review(&review_id, &ReviewStatus::Cleared, &make_string(&env, "no violation"));
+
+    // A cleared review is reportable again, and the dismissed report still
+    // counts toward the per-review budget.
+    client.report_review(&review_id, &reporter2, &ReportReason::Misleading, &make_string(&env, "still bad"));
+    assert_eq!(client.get_report_count(&review_id), 2);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::UnderReview);
+}
+
+#[test]
+fn test_same_reporter_cannot_report_again_after_dismissal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let review_id = make_bytes(&env, "repeat-after-clear");
+
+    client.submit_review(&review_id, &artist, &reviewer, &20u32, &make_string(&env, "meh"));
+    client.report_review(&review_id, &reporter, &ReportReason::Spam, &make_string(&env, "spam"));
+    client.moderate_review(&review_id, &ReviewStatus::Cleared, &make_string(&env, "dismissed"));
+
+    let result = client.try_report_review(
+        &review_id,
+        &reporter,
+        &ReportReason::Abuse,
+        &make_string(&env, "again"),
+    );
+    assert_eq!(result, Err(Ok(ReputationError::AlreadyReported)));
+    assert_eq!(client.get_report_count(&review_id), 1);
+}
+
+#[test]
 fn test_report_removed_review_fails() {
     let env = Env::default();
     env.mock_all_auths();
