@@ -1,7 +1,7 @@
 extern crate std;
 use soroban_sdk::{
     contract, contractimpl, testutils::{Address as _, Events as _, Ledger as _},
-    Address, Bytes, Env, String, IntoVal,
+    Address, Bytes, Env, String, Symbol, IntoVal,
 };
 
 use crate::errors::DisputeError;
@@ -11,12 +11,33 @@ use crate::{DisputeArbiter, DisputeArbiterClient};
 #[contract]
 pub struct MockEscrow;
 
+impl MockEscrow {
+    /// Counts settlements so a test can prove a refused replay never reached
+    /// the escrow (#41).
+    fn record_settlement(env: &Env) {
+        let key = Symbol::new(env, "settled");
+        let count: u32 = env.storage().instance().get(&key).unwrap_or(0u32);
+        env.storage().instance().set(&key, &(count + 1));
+    }
+}
+
 #[contractimpl]
 impl MockEscrow {
     pub fn open_dis(_env: Env, _commission_id: Bytes, _initiator: Address) {}
-    pub fn refund_cl(_env: Env, _commission_id: Bytes, _config_contract: Address) {}
+    pub fn refund_cl(env: Env, _commission_id: Bytes, _config_contract: Address) {
+        Self::record_settlement(&env);
+    }
     pub fn release_p(_env: Env, _commission_id: Bytes, _config_contract: Address) {}
-    pub fn rel_pay(_env: Env, _commission_id: Bytes, _config_contract: Address) {}
+    pub fn rel_pay(env: Env, _commission_id: Bytes, _config_contract: Address) {
+        Self::record_settlement(&env);
+    }
+    /// How many settlement calls this mock has received.
+    pub fn settlement_count(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "settled"))
+            .unwrap_or(0u32)
+    }
 }
 
 #[contract]
@@ -154,8 +175,7 @@ fn test_resolve_for_client_not_found_fails() {
 }
 
 #[test]
-#[ignore = "requires a live escrow contract"]
-fn test_resolve_for_client_wrong_status_fails() {
+fn test_resolve_for_client_twice_is_rejected() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
     env.mock_all_auths();
@@ -164,9 +184,21 @@ fn test_resolve_for_client_wrong_status_fails() {
     client.initialize(&admin, &escrow, &config, &100u32);
     let commission_id = Bytes::from_array(&env, &[1u8, 2, 3]);
     client.open_dispute(&commission_id, &initiator);
+
     client.resolve_for_client(&commission_id, &String::from_str(&env, "first"));
     let result = client.try_resolve_for_client(&commission_id, &String::from_str(&env, "second"));
-    assert_eq!(result.unwrap_err().unwrap(), DisputeError::InvalidStatus);
+
+    assert_eq!(result.unwrap_err().unwrap(), DisputeError::AlreadyResolved);
+    // The first decision stands, its note included.
+    let record = client.get_dispute(&commission_id);
+    assert_eq!(record.status, DisputeStatus::ResolvedForClient);
+    assert_eq!(
+        record.resolution_note,
+        Some(String::from_str(&env, "first"))
+    );
+    // And the replay never reached the escrow.
+    let escrow_client = MockEscrowClient::new(&env, &escrow);
+    assert_eq!(escrow_client.settlement_count(), 1);
 }
 
 // ========== resolve_for_artist ==========
@@ -200,8 +232,7 @@ fn test_resolve_for_artist_not_found_fails() {
 }
 
 #[test]
-#[ignore = "requires a live escrow contract"]
-fn test_resolve_for_artist_wrong_status_fails() {
+fn test_resolve_for_artist_twice_is_rejected() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
     env.mock_all_auths();
@@ -210,9 +241,19 @@ fn test_resolve_for_artist_wrong_status_fails() {
     client.initialize(&admin, &escrow, &config, &100u32);
     let commission_id = Bytes::from_array(&env, &[1u8, 2, 3]);
     client.open_dispute(&commission_id, &initiator);
+
     client.resolve_for_artist(&commission_id, &String::from_str(&env, "first"));
     let result = client.try_resolve_for_artist(&commission_id, &String::from_str(&env, "second"));
-    assert_eq!(result.unwrap_err().unwrap(), DisputeError::InvalidStatus);
+
+    assert_eq!(result.unwrap_err().unwrap(), DisputeError::AlreadyResolved);
+    let record = client.get_dispute(&commission_id);
+    assert_eq!(record.status, DisputeStatus::ResolvedForArtist);
+    assert_eq!(
+        record.resolution_note,
+        Some(String::from_str(&env, "first"))
+    );
+    let escrow_client = MockEscrowClient::new(&env, &escrow);
+    assert_eq!(escrow_client.settlement_count(), 1);
 }
 
 // ========== partial_resolve ==========
@@ -274,8 +315,7 @@ fn test_partial_resolve_not_found_fails() {
 }
 
 #[test]
-#[ignore = "requires a live escrow contract"]
-fn test_partial_resolve_wrong_status_fails() {
+fn test_second_resolution_through_another_path_is_rejected() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
     env.mock_all_auths();
@@ -285,8 +325,26 @@ fn test_partial_resolve_wrong_status_fails() {
     let commission_id = Bytes::from_array(&env, &[1u8, 2, 3]);
     client.open_dispute(&commission_id, &initiator);
     client.resolve_for_client(&commission_id, &String::from_str(&env, "done"));
-    let result = client.try_partial_resolve(&commission_id, &5000u32, &String::from_str(&env, "note"));
-    assert_eq!(result.unwrap_err().unwrap(), DisputeError::InvalidStatus);
+
+    // A different settlement path must not overwrite the first decision.
+    let partial = client.try_partial_resolve(
+        &commission_id,
+        &5000u32,
+        &String::from_str(&env, "note"),
+    );
+    assert_eq!(partial.unwrap_err().unwrap(), DisputeError::AlreadyResolved);
+    let reversed = client.try_resolve_for_artist(&commission_id, &String::from_str(&env, "note"));
+    assert_eq!(
+        reversed.unwrap_err().unwrap(),
+        DisputeError::AlreadyResolved
+    );
+
+    assert_eq!(
+        client.get_dispute(&commission_id).status,
+        DisputeStatus::ResolvedForClient
+    );
+    let escrow_client = MockEscrowClient::new(&env, &escrow);
+    assert_eq!(escrow_client.settlement_count(), 1);
 }
 
 // ========== auto_resolve ==========
@@ -348,8 +406,7 @@ fn test_auto_resolve_not_found_fails() {
 }
 
 #[test]
-#[ignore = "requires a live escrow contract"]
-fn test_auto_resolve_wrong_status_fails() {
+fn test_auto_resolve_twice_is_rejected() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
     env.mock_all_auths();
@@ -359,9 +416,18 @@ fn test_auto_resolve_wrong_status_fails() {
     let commission_id = Bytes::from_array(&env, &[1u8, 2, 3]);
     client.open_dispute(&commission_id, &initiator);
     env.ledger().with_mut(|l| l.sequence_number = 101);
+
     client.auto_resolve(&commission_id);
     let result = client.try_auto_resolve(&commission_id);
-    assert_eq!(result.unwrap_err().unwrap(), DisputeError::InvalidStatus);
+
+    assert_eq!(result.unwrap_err().unwrap(), DisputeError::AlreadyResolved);
+    assert_eq!(
+        client.get_dispute(&commission_id).status,
+        DisputeStatus::AutoResolved
+    );
+    // The second auto-resolve must not refund again.
+    let escrow_client = MockEscrowClient::new(&env, &escrow);
+    assert_eq!(escrow_client.settlement_count(), 1);
 }
 
 // ========== get_dispute ==========
