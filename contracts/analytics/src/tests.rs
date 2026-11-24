@@ -2,10 +2,11 @@ extern crate std;
 use std::format;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{Address as _, Events as _, Ledger as _},
     Address, Bytes, Env, String,
 };
 
+use crate::types::{ArtistMetrics, DataKey};
 use crate::{AnalyticsContract, AnalyticsContractClient, errors::AnalyticsError};
 
 fn setup(env: &Env) -> (AnalyticsContractClient<'_>, Address) {
@@ -302,6 +303,126 @@ fn test_get_metrics_not_found() {
     assert_eq!(result, Err(Ok(AnalyticsError::NotFound)));
 }
 
+// ── Absent data vs a real zero (#46) ──────────────────────────────────────
+
+fn zero_metrics() -> ArtistMetrics {
+    ArtistMetrics {
+        total_earnings: 0,
+        completed_count: 0,
+        cancelled_count: 0,
+        response_time_sum: 0,
+        response_time_count: 0,
+        satisfaction_score_sum: 0,
+        satisfaction_score_count: 0,
+        last_updated_ledger: 0,
+    }
+}
+
+fn store_metrics(
+    env: &Env,
+    client: &AnalyticsContractClient,
+    artist: &Address,
+    metrics: &ArtistMetrics,
+) {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Metrics(artist.clone()), metrics);
+    });
+}
+
+#[test]
+fn test_absent_metrics_report_not_found_not_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    // No record at all: every query says "absent", none of them says "0".
+    let artist = Address::generate(&env);
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+    assert_eq!(
+        client.try_get_completion_rate(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+    assert_eq!(
+        client.try_get_avg_response_time(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+    assert_eq!(
+        client.try_get_avg_satisfaction(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+    assert_eq!(
+        client.try_predict_earnings(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+}
+
+#[test]
+fn test_real_zero_is_distinct_from_absent_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    // An artist with a record but no completed commissions and no response
+    // times: the derived values are genuine zeros.
+    let artist = Address::generate(&env);
+    client.record_satisfaction(&artist, &50u32);
+
+    assert!(client.try_get_metrics(&artist).is_ok());
+    assert_eq!(client.get_completion_rate(&artist), 0);
+    assert_eq!(client.get_avg_response_time(&artist), 0);
+    assert_eq!(client.predict_earnings(&artist), 0);
+
+    // The same query on an artist with no record is absence, not zero.
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_get_completion_rate(&stranger),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+}
+
+#[test]
+fn test_inconsistent_metric_data_is_rejected_as_invalid() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    // A maintained sum with a zero sample count cannot be averaged.
+    let bad_satisfaction = Address::generate(&env);
+    let mut metrics = zero_metrics();
+    metrics.satisfaction_score_sum = 50;
+    store_metrics(&env, &client, &bad_satisfaction, &metrics);
+
+    // Earnings without a completed commission contradict each other.
+    let bad_earnings = Address::generate(&env);
+    let mut metrics = zero_metrics();
+    metrics.total_earnings = 1_000;
+    store_metrics(&env, &client, &bad_earnings, &metrics);
+
+    for artist in [bad_satisfaction, bad_earnings] {
+        assert_eq!(
+            client.try_get_metrics(&artist),
+            Err(Ok(AnalyticsError::InvalidMetricData))
+        );
+        assert_eq!(
+            client.try_get_avg_satisfaction(&artist),
+            Err(Ok(AnalyticsError::InvalidMetricData))
+        );
+        assert_eq!(
+            client.try_get_completion_rate(&artist),
+            Err(Ok(AnalyticsError::InvalidMetricData))
+        );
+        assert_eq!(
+            client.try_predict_earnings(&artist),
+            Err(Ok(AnalyticsError::InvalidMetricData))
+        );
+    }
+}
+
 // ── Bounded page reads (#650) ───────────────────────────────────────────────
 
 #[test]
@@ -341,6 +462,109 @@ fn test_get_earnings_returns_bounded_page() {
 
     // A limit of 0 is an empty page rather than an unbounded read.
     assert_eq!(client.get_earnings(&artist, &0, &0).len(), 0);
+}
+
+// ── Query windows (#45) ─────────────────────────────────────────────────────
+
+/// An inverted window is rejected, not silently normalised.
+#[test]
+fn test_query_window_rejects_inverted_range() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+
+    assert_eq!(
+        client.try_get_earnings_in_window(&artist, &200, &100, &0, &10),
+        Err(Ok(AnalyticsError::InvalidQueryWindow)),
+    );
+}
+
+/// A window wider than the documented maximum is rejected, while a window of
+/// exactly the maximum span is accepted.
+#[test]
+fn test_query_window_enforces_maximum_span() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+    let artist = Address::generate(&env);
+    let max = crate::types::MAX_QUERY_WINDOW_LEDGERS;
+
+    assert_eq!(
+        client.try_get_earnings_in_window(&artist, &0, &(max + 1), &0, &10),
+        Err(Ok(AnalyticsError::InvalidQueryWindow)),
+    );
+    assert!(
+        client.try_get_earnings_in_window(&artist, &0, &max, &0, &10).is_ok(),
+        "a window of exactly the maximum span must be accepted",
+    );
+}
+
+/// A normal window returns only the records recorded inside it.
+#[test]
+fn test_query_window_returns_only_records_inside_it() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let cat = make_string(&env, "ui");
+    let record_at = |ledger: u32, amount: i128| {
+        set_ledger_seq(&env, &client, ledger);
+        client.record_earning(
+            &artist,
+            &make_bytes(&env, "c"),
+            &cat,
+            &client_addr,
+            &amount,
+        );
+    };
+    record_at(100, 100);
+    record_at(200, 200);
+    record_at(300, 300);
+
+    let inside = client.get_earnings_in_window(&artist, &150, &250, &0, &10);
+    assert_eq!(inside.len(), 1, "only the ledger-200 record is in range");
+    assert_eq!(inside.get(0).unwrap().amount, 200);
+
+    // Both bounds are inclusive.
+    let edges = client.get_earnings_in_window(&artist, &100, &300, &0, &10);
+    assert_eq!(edges.len(), 3);
+
+    // The page bound still applies, and paging continues past skipped records.
+    let first_page = client.get_earnings_in_window(&artist, &100, &300, &0, &2);
+    assert_eq!(first_page.len(), 2);
+    let second_page = client.get_earnings_in_window(&artist, &100, &300, &2, &2);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page.get(0).unwrap().amount, 300);
+}
+
+/// A valid window with no records — including a zero-width window — is an
+/// empty result, not an error.
+#[test]
+fn test_query_window_with_no_records_is_empty() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    set_ledger_seq(&env, &client, ledger_inside_window());
+    seed_earnings(&env, &client, &artist, 1);
+    let recorded_at = ledger_inside_window();
+
+    // An artist with history, queried in a period that holds none of it.
+    let quiet = client.get_earnings_in_window(&artist, &(recorded_at + 1), &(recorded_at + 100), &0, &10);
+    assert_eq!(quiet.len(), 0);
+
+    // A single-ledger window is valid even when nothing was recorded there.
+    let point = client.get_earnings_in_window(&artist, &(recorded_at + 1), &(recorded_at + 1), &0, &10);
+    assert_eq!(point.len(), 0);
+
+    // An artist with no earnings at all is empty too.
+    let unknown = Address::generate(&env);
+    let none = client.get_earnings_in_window(&unknown, &0, &100, &0, &10);
+    assert_eq!(none.len(), 0);
 }
 
 // ── Retention / pruning (#651) ──────────────────────────────────────────────
@@ -518,4 +742,286 @@ fn test_prune_earnings_stops_at_a_protected_record() {
     // The in-window record survives.
     assert!(client.try_get_earning(&artist, &2).is_ok());
     assert_eq!(client.get_earning_count(&artist), 3);
+}
+
+// ── Atomicity of metric updates and events (#44) ─────────────────────────
+
+fn event_count(env: &Env) -> u32 {
+    env.events().all().len()
+}
+
+#[test]
+fn test_rejected_earning_leaves_no_aggregate_or_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let events_before = event_count(&env);
+
+    // A non-positive payout is refused before anything is written or
+    // announced.
+    let result = client.try_record_earning(
+        &artist,
+        &make_bytes(&env, "c1"),
+        &make_string(&env, "ui"),
+        &Address::generate(&env),
+        &0,
+    );
+    assert_eq!(result, Err(Ok(AnalyticsError::InvalidAmount)));
+
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+    assert_eq!(client.get_earning_count(&artist), 0);
+    assert_eq!(
+        event_count(&env),
+        events_before,
+        "a rejected update must not emit a success event"
+    );
+}
+
+#[test]
+fn test_earning_overflow_keeps_prior_aggregate_and_events() {
+// ── Overflow safety (#43) ────────────────────────────────────────────────
+
+fn empty_metrics() -> ArtistMetrics {
+    ArtistMetrics {
+        total_earnings: 0,
+        completed_count: 0,
+        cancelled_count: 0,
+        response_time_sum: 0,
+        response_time_count: 0,
+        satisfaction_score_sum: 0,
+        satisfaction_score_count: 0,
+        last_updated_ledger: 0,
+    }
+}
+
+/// Write an aggregate straight to storage, so a counter can be positioned at
+/// its maximum without recording billions of events to get there.
+fn seed_metrics(
+    env: &Env,
+    client: &AnalyticsContractClient,
+    artist: &Address,
+    metrics: &ArtistMetrics,
+) {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Metrics(artist.clone()), metrics);
+    });
+}
+
+#[test]
+fn test_record_earning_overflow_preserves_totals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let client_addr = Address::generate(&env);
+    let cat = make_string(&env, "ui");
+
+    client.record_earning(
+        &artist,
+        &make_bytes(&env, "max"),
+        &cat,
+        &client_addr,
+        &i128::MAX,
+    );
+    let metrics_before = client.get_metrics(&artist);
+    let events_before = event_count(&env);
+
+    let before = client.get_metrics(&artist);
+
+    // One more unit would wrap the lifetime total, so it is refused with an
+    // explicit error instead.
+    let result = client.try_record_earning(
+        &artist,
+        &make_bytes(&env, "over"),
+        &cat,
+        &client_addr,
+        &1,
+    );
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+
+    // The single earlier payout is untouched and the failure adds no event.
+    assert_eq!(client.get_metrics(&artist), metrics_before);
+    assert_eq!(client.get_earning_count(&artist), 1);
+    assert_eq!(event_count(&env), events_before);
+}
+
+#[test]
+fn test_rejected_response_time_leaves_no_aggregate_or_event() {
+    // The rejected update leaves both the aggregate and the earnings log
+    // exactly as they were.
+    assert_eq!(client.get_metrics(&artist), before);
+    assert_eq!(client.get_earning_count(&artist), 1);
+    assert_eq!(client.get_earning(&artist, &0).amount, i128::MAX);
+}
+
+#[test]
+fn test_completed_count_overflow_leaves_no_earning_record() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let events_before = event_count(&env);
+
+    let result = client.try_record_response_time(&artist, &0u64);
+    assert_eq!(result, Err(Ok(AnalyticsError::InvalidAmount)));
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+    assert_eq!(event_count(&env), events_before);
+}
+
+#[test]
+fn test_response_time_overflow_keeps_prior_aggregate_and_events() {
+    let mut metrics = empty_metrics();
+    metrics.completed_count = u32::MAX;
+    seed_metrics(&env, &client, &artist, &metrics);
+
+    let result = client.try_record_earning(
+        &artist,
+        &make_bytes(&env, "over"),
+        &make_string(&env, "ui"),
+        &Address::generate(&env),
+        &1_000,
+    );
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+
+    assert_eq!(client.get_metrics(&artist), metrics);
+    // The failure happened before the log append, so no index was consumed.
+    assert_eq!(client.get_earning_count(&artist), 0);
+    assert_eq!(
+        client.try_get_earning(&artist, &0),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+}
+
+#[test]
+fn test_response_time_sum_overflow_preserves_totals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    client.record_response_time(&artist, &u64::MAX);
+    let metrics_before = client.get_metrics(&artist);
+    let events_before = event_count(&env);
+
+    let result = client.try_record_response_time(&artist, &1u64);
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+    assert_eq!(client.get_metrics(&artist), metrics_before);
+    assert_eq!(event_count(&env), events_before);
+}
+
+#[test]
+fn test_rejected_satisfaction_leaves_no_aggregate_or_event() {
+    let before = client.get_metrics(&artist);
+
+    let result = client.try_record_response_time(&artist, &1u64);
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+
+    assert_eq!(client.get_metrics(&artist), before);
+    assert_eq!(client.get_avg_response_time(&artist), u64::MAX);
+}
+
+#[test]
+fn test_satisfaction_sum_overflow_preserves_totals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let events_before = event_count(&env);
+
+    // Both ends of the invalid range: too low and too high.
+    for bad_score in [5u32, 55u32] {
+        let result = client.try_record_satisfaction(&artist, &bad_score);
+        assert_eq!(result, Err(Ok(AnalyticsError::InvalidScore)));
+    }
+
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+    assert_eq!(event_count(&env), events_before);
+}
+
+#[test]
+fn test_successful_update_emits_exactly_one_event() {
+    let mut metrics = empty_metrics();
+    metrics.satisfaction_score_sum = u32::MAX - 5;
+    metrics.satisfaction_score_count = 1;
+    seed_metrics(&env, &client, &artist, &metrics);
+
+    let result = client.try_record_satisfaction(&artist, &10u32);
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+    assert_eq!(client.get_metrics(&artist), metrics);
+}
+
+#[test]
+fn test_completion_rate_overflow_is_reported() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let mut metrics = empty_metrics();
+    metrics.completed_count = u32::MAX;
+    metrics.cancelled_count = 1;
+    seed_metrics(&env, &client, &artist, &metrics);
+
+    // The denominator would wrap, so the rate is reported as an error rather
+    // than as a bogus percentage.
+    assert_eq!(
+        client.try_get_completion_rate(&artist),
+        Err(Ok(AnalyticsError::ArithmeticOverflow)),
+    );
+}
+
+#[test]
+fn test_earning_index_overflow_leaves_no_partial_update() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let artist = Address::generate(&env);
+    let events_before = event_count(&env);
+
+    client.record_earning(
+        &artist,
+        &make_bytes(&env, "c1"),
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::EarningCount(artist.clone()), &u32::MAX);
+    });
+
+    let result = client.try_record_earning(
+        &artist,
+        &make_bytes(&env, "over"),
+        &make_string(&env, "ui"),
+        &Address::generate(&env),
+        &1_000,
+    );
+
+    // Validation, writes and event publication stay paired: one accepted
+    // update, one announcement.
+    assert_eq!(event_count(&env), events_before + 1);
+    assert_eq!(client.get_metrics(&artist).total_earnings, 1_000);
+    assert_eq!(result, Err(Ok(AnalyticsError::ArithmeticOverflow)));
+
+    // Nothing was created for the artist and the index counter did not move.
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound)),
+    );
+    assert_eq!(client.get_earning_count(&artist), u32::MAX);
 }

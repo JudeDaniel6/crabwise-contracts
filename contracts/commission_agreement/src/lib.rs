@@ -56,11 +56,48 @@ include!("../../semver_types.rs");
 /// Cap on the retained cancellation history, so the list stays bounded.
 const CANCELLATION_HISTORY_LIMIT: u32 = 50;
 
+/// Topic of the canonical agreement-lifecycle event (`agr_sts`).
+///
+/// Published exactly once after a validated status transition has been
+/// persisted, so a listener can read the payload as the stored state rather
+/// than re-deriving it (#37).
+///
+/// Call this *after* the new status has been written to storage. The payload
+/// carries the status that is now stored, so event consumers and state readers
+/// can never disagree about the outcome of a call.
+fn publish_status(env: &Env, commission_id: &Bytes, status: AgreementStatus) {
+    env.events().publish(
+        (symbol_short!("agr_sts"),),
+        (commission_id.clone(), status),
+    );
+}
+
 fn load_agreement(env: &Env, commission_id: &Bytes) -> Result<AgreementRecord, AgreementError> {
     env.storage()
         .persistent()
         .get(&DataKey::Agreement(commission_id.clone()))
         .ok_or(AgreementError::NotFound)
+}
+
+/// Load an active agreement and authorize the caller to decide one of its
+/// milestones (closes #36).
+///
+/// Milestone decisions belong to the agreement's client alone. The artist and
+/// any unrelated address are rejected by `require_auth` before any state is
+/// read or written, so this gate is shared by every milestone decision entry
+/// point rather than re-implemented per function.
+fn authorize_milestone_decision(
+    env: &Env,
+    commission_id: &Bytes,
+) -> Result<AgreementRecord, AgreementError> {
+    let record = load_agreement(env, commission_id)?;
+    record.client.require_auth();
+
+    if record.status != AgreementStatus::Active {
+        return Err(AgreementError::InvalidStatus);
+    }
+
+    Ok(record)
 }
 
 /// Value of the milestones the client has already approved. This is the basis
@@ -251,6 +288,7 @@ impl CommissionAgreementContract {
 
         record.status = AgreementStatus::Active;
         env.storage().persistent().set(&DataKey::Agreement(commission_id.clone()), &record);
+        publish_status(&env, &commission_id, record.status);
 
         env.events().publish((symbol_short!("agr_acpt"),), (commission_id.clone(),));
         env.events().publish((symbol_short!("agr_ok"),), (commission_id,));
@@ -279,6 +317,7 @@ impl CommissionAgreementContract {
 
         record.status = AgreementStatus::Cancelled;
         env.storage().persistent().set(&DataKey::Agreement(commission_id.clone()), &record);
+        publish_status(&env, &commission_id, record.status);
 
         env.events().publish((symbol_short!("agr_rjct"),), (commission_id.clone(), reason.clone()));
         env.events().publish((symbol_short!("agr_rej"),), (commission_id, reason));
@@ -332,16 +371,12 @@ impl CommissionAgreementContract {
         Ok(())
     }
 
+    /// Approve a pending milestone (client auth required).
+    ///
+    /// Closes #36 – milestone decisions are client-only, and the authorization
+    /// matrix is asserted in `agency_tests.rs`.
     pub fn approve_milestone(env: Env, commission_id: Bytes, milestone_id: Bytes) -> Result<(), AgreementError> {
-        let mut record: AgreementRecord = env.storage().persistent()
-            .get(&DataKey::Agreement(commission_id.clone()))
-            .ok_or(AgreementError::NotFound)?;
-
-        record.client.require_auth();
-
-        if record.status != AgreementStatus::Active {
-            return Err(AgreementError::InvalidStatus);
-        }
+        let mut record = authorize_milestone_decision(&env, &commission_id)?;
 
         // ── Serialization lock for milestone state transitions (closes #589) ─
         // Acquire the lock before reading the milestone status.  Any concurrent
@@ -370,6 +405,10 @@ impl CommissionAgreementContract {
         if all_approved {
             record.status = AgreementStatus::Completed;
             env.storage().persistent().set(&DataKey::Agreement(commission_id.clone()), &record);
+            // The transition to `Completed` is a lifecycle change of the
+            // agreement itself, not just of the milestone, so it gets the same
+            // canonical status event (#37).
+            publish_status(&env, &commission_id, record.status);
         }
 
         env.events().publish((symbol_short!("ms_appr"),), (commission_id.clone(), milestone_id.clone()));
@@ -377,6 +416,34 @@ impl CommissionAgreementContract {
         env.storage().persistent().remove(&lock_key);
 
         env.events().publish((symbol_short!("ms_apprvd"),), (commission_id, milestone_id));
+        Ok(())
+    }
+
+    /// Reject a pending milestone (client auth required).
+    ///
+    /// A rejected milestone is terminal: it cannot later be approved, and it
+    /// never counts toward agreement completion. Rejecting one milestone does
+    /// not cancel the agreement. Closes #36.
+    pub fn reject_milestone(env: Env, commission_id: Bytes, milestone_id: Bytes) -> Result<(), AgreementError> {
+        let _record = authorize_milestone_decision(&env, &commission_id)?;
+
+        let lock_key = acquire_milestone_lock(&env, &commission_id, &milestone_id)?;
+
+        let mut milestone: MilestoneRecord = env.storage().persistent()
+            .get(&DataKey::Milestone(commission_id.clone(), milestone_id.clone()))
+            .ok_or(AgreementError::NotFound)?;
+
+        if milestone.status != MilestoneStatus::Pending {
+            env.storage().persistent().remove(&lock_key);
+            return Err(AgreementError::InvalidStatus);
+        }
+
+        milestone.status = MilestoneStatus::Rejected;
+        env.storage().persistent().set(&DataKey::Milestone(commission_id.clone(), milestone_id.clone()), &milestone);
+        replace_milestone(&env, &commission_id, &milestone_id, &milestone);
+
+        env.events().publish((symbol_short!("ms_rjct"),), (commission_id, milestone_id));
+        env.storage().persistent().remove(&lock_key);
         Ok(())
     }
 
@@ -769,6 +836,7 @@ impl CommissionAgreementContract {
         env.storage()
             .persistent()
             .set(&DataKey::Agreement(commission_id.clone()), &record);
+        publish_status(&env, &commission_id, record.status);
 
         let cancellation_record = CancellationRecord {
             commission_id: commission_id.clone(),
@@ -1335,7 +1403,7 @@ impl CommissionAgreementContract {
             && env.ledger().sequence() <= record.created_ledger + policy.grace_ledgers
     }
 }
-#[cfg(all(test, feature = "legacy_tests"))]
+#[cfg(test)]
 mod integration_tests;
 
 // ── Helpers extracted from large contract functions ─────────────────────────
