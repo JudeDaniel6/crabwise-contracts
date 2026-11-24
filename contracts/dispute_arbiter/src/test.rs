@@ -572,7 +572,28 @@ fn test_submit_evidence_within_the_window_succeeds() {
 }
 
 #[test]
-fn test_submit_evidence_exactly_at_the_deadline_is_allowed() {
+fn test_submit_evidence_one_ledger_before_the_deadline_is_allowed() {
+    let (env, admin, escrow, config, _token) = create_test_env();
+    let initiator = Address::generate(&env);
+    let submitter = Address::generate(&env);
+    env.mock_all_auths();
+    let arbiter = env.register_contract(None, DisputeArbiter);
+    let client = DisputeArbiterClient::new(&env, &arbiter);
+    client.initialize(&admin, &escrow, &config, &100u32);
+
+    let commission_id = Bytes::from_array(&env, &[1u8, 2, 3]);
+    client.open_dispute(&commission_id, &initiator);
+    env.ledger().with_mut(|l| l.sequence_number = 99);
+    client.submit_evidence(
+        &commission_id,
+        &submitter,
+        &Bytes::from_slice(&env, b"last minute"),
+    );
+    assert_eq!(client.get_evidence_count(&commission_id), 1);
+}
+
+#[test]
+fn test_submit_evidence_at_the_deadline_is_rejected() {
     let (env, admin, escrow, config, _token) = create_test_env();
     let initiator = Address::generate(&env);
     let submitter = Address::generate(&env);
@@ -584,8 +605,55 @@ fn test_submit_evidence_exactly_at_the_deadline_is_allowed() {
     let commission_id = Bytes::from_array(&env, &[1u8, 2, 3]);
     client.open_dispute(&commission_id, &initiator);
     env.ledger().with_mut(|l| l.sequence_number = 100);
-    client.submit_evidence(&commission_id, &submitter, &Bytes::from_slice(&env, b"last minute"));
-    assert_eq!(client.get_evidence_count(&commission_id), 1);
+    let result = client.try_submit_evidence(
+        &commission_id,
+        &submitter,
+        &Bytes::from_slice(&env, b"too late"),
+    );
+    assert_eq!(
+        result.unwrap_err().unwrap(),
+        DisputeError::EvidenceWindowClosed
+    );
+    assert_eq!(client.get_evidence_count(&commission_id), 0);
+}
+
+#[test]
+fn test_deadline_is_a_single_boundary_that_only_closes_the_window() {
+    let (env, admin, escrow, config, _token) = create_test_env();
+    let initiator = Address::generate(&env);
+    let submitter = Address::generate(&env);
+    env.mock_all_auths();
+    let arbiter = env.register_contract(None, DisputeArbiter);
+    let client = DisputeArbiterClient::new(&env, &arbiter);
+    client.initialize(&admin, &escrow, &config, &100u32);
+
+    let commission_id = Bytes::from_array(&env, &[1u8, 2, 3]);
+    client.open_dispute(&commission_id, &initiator);
+    let deadline = client.get_dispute_deadline(&commission_id);
+
+    // The ledger before the deadline still takes evidence, and cannot settle.
+    env.ledger().with_mut(|l| l.sequence_number = deadline - 1);
+    client.submit_evidence(&commission_id, &submitter, &Bytes::from_slice(&env, b"ok"));
+    let early = client.try_auto_resolve(&commission_id);
+    assert_eq!(early.unwrap_err().unwrap(), DisputeError::AutoResolveNotDue);
+
+    // At the deadline the same ledger refuses evidence and allows settlement:
+    // the windows are adjacent, not overlapping.
+    env.ledger().with_mut(|l| l.sequence_number = deadline);
+    let late = client.try_submit_evidence(
+        &commission_id,
+        &submitter,
+        &Bytes::from_slice(&env, b"closed"),
+    );
+    assert_eq!(
+        late.unwrap_err().unwrap(),
+        DisputeError::EvidenceWindowClosed
+    );
+    client.auto_resolve(&commission_id);
+    assert_eq!(
+        client.get_dispute(&commission_id).status,
+        DisputeStatus::AutoResolved
+    );
 }
 
 #[test]
