@@ -412,6 +412,114 @@ fn test_escalate_appeal() {
     assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Escalated);
 }
 
+/// A review that moderation has `Removed`, with a `Pending` appeal against it.
+fn removed_review_with_appeal(
+    env: &Env,
+    client: &ReputationContractClient<'_>,
+    suffix: &str,
+    rating_x10: u32,
+) -> (Address, Bytes) {
+    let artist = Address::generate(env);
+    let reviewer = Address::generate(env);
+    let reporter = Address::generate(env);
+    let review_id = make_bytes(env, suffix);
+
+    client.submit_review(
+        &review_id,
+        &artist,
+        &reviewer,
+        &rating_x10,
+        &make_string(env, "review"),
+    );
+    client.report_review(
+        &review_id,
+        &reporter,
+        &ReportReason::Spam,
+        &make_string(env, "report"),
+    );
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(env, "removed"));
+    client.file_appeal(&review_id, &artist, &make_string(env, "appeal"));
+
+    (artist, review_id)
+}
+
+#[test]
+fn test_appeal_status_terminal_model() {
+    assert!(!AppealStatus::Pending.is_terminal());
+    assert!(!AppealStatus::Pending.is_decided());
+
+    assert!(AppealStatus::Upheld.is_terminal());
+    assert!(AppealStatus::Upheld.is_decided());
+
+    assert!(AppealStatus::Denied.is_terminal());
+    assert!(AppealStatus::Denied.is_decided());
+
+    // Escalated is terminal for this contract but carries no decision: the
+    // appeal belongs to the dispute arbiter from that point on.
+    assert!(AppealStatus::Escalated.is_terminal());
+    assert!(!AppealStatus::Escalated.is_decided());
+}
+
+#[test]
+fn test_repeated_upheld_decision_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "dup-upheld", 40);
+    client.resolve_appeal(&review_id, &AppealStatus::Upheld);
+    let score_after_decision = client.get_score(&artist);
+
+    let result = client.try_resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+
+    // The first decision stands, and the review is not reinstated twice.
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Upheld);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Active);
+    assert_eq!(client.get_score(&artist), score_after_decision);
+}
+
+#[test]
+fn test_conflicting_decision_after_denial_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "conflict", 40);
+    client.resolve_appeal(&review_id, &AppealStatus::Denied);
+    let score_after_decision = client.get_score(&artist);
+    assert_eq!(score_after_decision.active_reviews, 0);
+    assert_eq!(score_after_decision.removed_reviews, 1);
+
+    // A later `Upheld` must not overturn the denial.
+    let result = client.try_resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Denied);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Removed);
+    assert_eq!(client.get_score(&artist), score_after_decision);
+}
+
+#[test]
+fn test_no_decision_is_allowed_after_escalation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    let (artist, review_id) = removed_review_with_appeal(&env, &client, "escalated", 30);
+    client.escalate_appeal(&review_id, &artist);
+    let score_after_escalation = client.get_score(&artist);
+
+    for decision in [AppealStatus::Upheld, AppealStatus::Denied] {
+        let result = client.try_resolve_appeal(&review_id, &decision);
+        assert_eq!(result, Err(Ok(ReputationError::InvalidStatus)));
+    }
+
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Escalated);
+    assert_eq!(client.get_review(&review_id).status, ReviewStatus::Removed);
+    assert_eq!(client.get_score(&artist), score_after_escalation);
+}
+
 #[test]
 fn test_third_party_cannot_file_appeal() {
     let env = Env::default();
