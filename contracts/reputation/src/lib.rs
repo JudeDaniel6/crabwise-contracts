@@ -50,6 +50,32 @@ fn load_aggregate(env: &Env, subject: &Address) -> ReviewAggregate {
         })
 }
 
+/// Whether `reporter` already reported `review_id` among its first `count`
+/// reports (#050).
+///
+/// Report records are kept after a review is dismissed (`Cleared`), so waiting
+/// for moderation to clear the review does not reset a reporter's slot.
+fn reporter_has_reported(
+    env: &Env,
+    review_id: &Bytes,
+    reporter: &Address,
+    count: u32,
+) -> bool {
+    for i in 0..count {
+        let key = DataKey::Report(review_id.clone(), i);
+        if let Some(record) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, ReportRecord>(&key)
+        {
+            if record.reporter == *reporter {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn save_aggregate(env: &Env, aggregate: &ReviewAggregate) {
     let key = DataKey::Aggregate(aggregate.subject.clone());
     env.storage().persistent().set(&key, aggregate);
@@ -156,19 +182,18 @@ impl ReputationContract {
             .persistent()
             .get(&DataKey::ReportCount(review_id.clone()))
             .unwrap_or(0u32);
-        for i in 0..count {
-            let r: ReportRecord = env.storage()
-                .persistent()
-                .get(&DataKey::Report(review_id.clone(), i))
-                .unwrap();
-            if r.reporter == reporter {
-                return Err(ReputationError::AlreadyReported);
-            }
+        // #050: one report per reporter per review. The check covers every
+        // stored report, including reports whose review was later dismissed,
+        // so a reporter cannot regain a slot by being cleared.
+        if reporter_has_reported(&env, &review_id, &reporter, count) {
+            return Err(ReputationError::AlreadyReported);
         }
 
         // #976: bound the queue before writing. The queue is instance storage
         // that anyone can drive with `report_review`, so its growth is capped
-        // both globally and per review.
+        // both globally and per review. #050 keeps the per-review cap counting
+        // reports from dismissed rounds as well: clearing a review does not
+        // reset its report budget.
         if count >= MAX_REPORTS_PER_REVIEW {
             return Err(ReputationError::ReportLimitReached);
         }
