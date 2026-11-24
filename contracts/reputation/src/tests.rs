@@ -546,40 +546,6 @@ fn test_appeal_deadline_is_review_ledger_plus_window() {
 }
 
 #[test]
-fn test_file_appeal_at_the_boundary_is_allowed() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = setup(&env);
-
-    let artist = Address::generate(&env);
-    let review_id = make_bytes(&env, "w2");
-    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
-    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
-    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
-
-    env.ledger().with_mut(|l| l.sequence_number = DEFAULT_APPEAL_WINDOW_LEDGERS);
-    client.file_appeal(&review_id, &artist, &make_string(&env, "just in time"));
-    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Pending);
-}
-
-#[test]
-fn test_file_appeal_past_the_window_is_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin) = setup(&env);
-
-    let artist = Address::generate(&env);
-    let review_id = make_bytes(&env, "w3");
-    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
-    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
-    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
-
-    env.ledger().with_mut(|l| l.sequence_number = DEFAULT_APPEAL_WINDOW_LEDGERS + 1);
-    let result = client.try_file_appeal(&review_id, &artist, &make_string(&env, "too late"));
-    assert_eq!(result, Err(Ok(ReputationError::AppealWindowClosed)));
-}
-
-#[test]
 fn test_set_appeal_window_rejects_out_of_range() {
     let env = Env::default();
     env.mock_all_auths();
@@ -594,20 +560,66 @@ fn test_set_appeal_window_rejects_out_of_range() {
 }
 
 #[test]
-fn test_a_custom_window_bounds_filing() {
+fn test_file_appeal_immediately_before_the_boundary_is_allowed() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup(&env);
+    // A 10-ledger window keeps the ledger jump small; jumping to the default
+    // ~17k-ledger window would archive the contract's instance entry in the
+    // test host.
+    client.set_appeal_window(&admin, &10u32);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "w-before");
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    env.ledger().with_mut(|l| l.sequence_number = 9);
+    assert_eq!(client.get_appeal_deadline(&review_id), 10);
+    assert_eq!(client.ledgers_to_appeal(&review_id), 1);
+    client.file_appeal(&review_id, &artist, &make_string(&env, "one ledger left"));
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Pending);
+}
+
+#[test]
+fn test_file_appeal_at_the_boundary_is_allowed() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, admin) = setup(&env);
     client.set_appeal_window(&admin, &10u32);
 
     let artist = Address::generate(&env);
-    let review_id = make_bytes(&env, "w4");
+    let review_id = make_bytes(&env, "w2");
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    env.ledger().with_mut(|l| l.sequence_number = 10);
+    assert_eq!(client.get_appeal_deadline(&review_id), 10);
+    // Zero ledgers remain, but the deadline ledger itself is inclusive.
+    assert_eq!(client.ledgers_to_appeal(&review_id), 0);
+    client.file_appeal(&review_id, &artist, &make_string(&env, "just in time"));
+    assert_eq!(client.get_appeal(&review_id).status, AppealStatus::Pending);
+}
+
+#[test]
+fn test_file_appeal_past_the_window_is_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin) = setup(&env);
+    client.set_appeal_window(&admin, &10u32);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "w3");
     client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
     client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
     client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
 
     env.ledger().with_mut(|l| l.sequence_number = 11);
-    let result = client.try_file_appeal(&review_id, &artist, &make_string(&env, "late"));
+    assert_eq!(client.get_appeal_deadline(&review_id), 10);
+    assert_eq!(client.ledgers_to_appeal(&review_id), 0);
+    let result = client.try_file_appeal(&review_id, &artist, &make_string(&env, "too late"));
     assert_eq!(result, Err(Ok(ReputationError::AppealWindowClosed)));
 }
 
