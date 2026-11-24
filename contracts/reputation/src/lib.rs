@@ -96,8 +96,19 @@ impl ReputationContract {
         if !(10..=50).contains(&rating_x10) {
             return Err(ReputationError::InvalidRating);
         }
+
+        // #48: `(artist, reviewer)` is the unique review key — a client may
+        // leave at most one review for a given artist, whatever review id they
+        // choose. Checking it before anything is written means a duplicate can
+        // never inflate the subject's aggregate.
+        let reviewer_key = DataKey::ReviewerIndex(artist.clone(), reviewer.clone());
+        if env.storage().persistent().has(&reviewer_key) {
+            return Err(ReputationError::DuplicateReview);
+        }
+        // Review ids are also unique; reusing one would overwrite the stored
+        // record belonging to another submission.
         if env.storage().persistent().has(&DataKey::Review(review_id.clone())) {
-            return Err(ReputationError::AlreadyReported);
+            return Err(ReputationError::DuplicateReview);
         }
 
         let record = ReviewRecord {
@@ -112,6 +123,17 @@ impl ReputationContract {
         env.storage().persistent().set(&DataKey::Review(review_id.clone()), &record);
         env.storage().persistent().extend_ttl(
             &DataKey::Review(review_id.clone()),
+            REPUTATION_TTL_LEDGERS,
+            REPUTATION_TTL_LEDGERS,
+        );
+        // Deliberately not cleared when a review is removed by moderation: a
+        // client whose review was taken down must not be able to file a fresh
+        // rating for the same artist and re-inflate the aggregate.
+        env.storage()
+            .persistent()
+            .set(&reviewer_key, &review_id);
+        env.storage().persistent().extend_ttl(
+            &reviewer_key,
             REPUTATION_TTL_LEDGERS,
             REPUTATION_TTL_LEDGERS,
         );
