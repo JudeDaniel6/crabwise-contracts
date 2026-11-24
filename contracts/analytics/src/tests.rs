@@ -303,6 +303,126 @@ fn test_get_metrics_not_found() {
     assert_eq!(result, Err(Ok(AnalyticsError::NotFound)));
 }
 
+// ── Absent data vs a real zero (#46) ──────────────────────────────────────
+
+fn zero_metrics() -> ArtistMetrics {
+    ArtistMetrics {
+        total_earnings: 0,
+        completed_count: 0,
+        cancelled_count: 0,
+        response_time_sum: 0,
+        response_time_count: 0,
+        satisfaction_score_sum: 0,
+        satisfaction_score_count: 0,
+        last_updated_ledger: 0,
+    }
+}
+
+fn store_metrics(
+    env: &Env,
+    client: &AnalyticsContractClient,
+    artist: &Address,
+    metrics: &ArtistMetrics,
+) {
+    env.as_contract(&client.address, || {
+        env.storage()
+            .persistent()
+            .set(&DataKey::Metrics(artist.clone()), metrics);
+    });
+}
+
+#[test]
+fn test_absent_metrics_report_not_found_not_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    // No record at all: every query says "absent", none of them says "0".
+    let artist = Address::generate(&env);
+    assert_eq!(
+        client.try_get_metrics(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+    assert_eq!(
+        client.try_get_completion_rate(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+    assert_eq!(
+        client.try_get_avg_response_time(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+    assert_eq!(
+        client.try_get_avg_satisfaction(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+    assert_eq!(
+        client.try_predict_earnings(&artist),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+}
+
+#[test]
+fn test_real_zero_is_distinct_from_absent_data() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    // An artist with a record but no completed commissions and no response
+    // times: the derived values are genuine zeros.
+    let artist = Address::generate(&env);
+    client.record_satisfaction(&artist, &50u32);
+
+    assert!(client.try_get_metrics(&artist).is_ok());
+    assert_eq!(client.get_completion_rate(&artist), 0);
+    assert_eq!(client.get_avg_response_time(&artist), 0);
+    assert_eq!(client.predict_earnings(&artist), 0);
+
+    // The same query on an artist with no record is absence, not zero.
+    let stranger = Address::generate(&env);
+    assert_eq!(
+        client.try_get_completion_rate(&stranger),
+        Err(Ok(AnalyticsError::NotFound))
+    );
+}
+
+#[test]
+fn test_inconsistent_metric_data_is_rejected_as_invalid() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin) = setup(&env);
+
+    // A maintained sum with a zero sample count cannot be averaged.
+    let bad_satisfaction = Address::generate(&env);
+    let mut metrics = zero_metrics();
+    metrics.satisfaction_score_sum = 50;
+    store_metrics(&env, &client, &bad_satisfaction, &metrics);
+
+    // Earnings without a completed commission contradict each other.
+    let bad_earnings = Address::generate(&env);
+    let mut metrics = zero_metrics();
+    metrics.total_earnings = 1_000;
+    store_metrics(&env, &client, &bad_earnings, &metrics);
+
+    for artist in [bad_satisfaction, bad_earnings] {
+        assert_eq!(
+            client.try_get_metrics(&artist),
+            Err(Ok(AnalyticsError::InvalidMetricData))
+        );
+        assert_eq!(
+            client.try_get_avg_satisfaction(&artist),
+            Err(Ok(AnalyticsError::InvalidMetricData))
+        );
+        assert_eq!(
+            client.try_get_completion_rate(&artist),
+            Err(Ok(AnalyticsError::InvalidMetricData))
+        );
+        assert_eq!(
+            client.try_predict_earnings(&artist),
+            Err(Ok(AnalyticsError::InvalidMetricData))
+        );
+    }
+}
+
 // ── Bounded page reads (#650) ───────────────────────────────────────────────
 
 #[test]
