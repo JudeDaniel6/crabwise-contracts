@@ -1,7 +1,7 @@
 extern crate std;
 
 use soroban_sdk::{
-    testutils::{Address as _, Ledger as _},
+    testutils::{storage::Persistent as _, Address as _, Ledger as _},
     Address, Bytes, Env, String,
 };
 
@@ -10,17 +10,26 @@ use crate::{
     errors::ReputationError,
     score::{MAX_RATING_X10, MIN_RATING_X10},
     types::{
-        AppealStatus, ReportReason, ReviewStatus, DEFAULT_APPEAL_WINDOW_LEDGERS,
+        AppealStatus, DataKey, ReportReason, ReviewStatus, DEFAULT_APPEAL_WINDOW_LEDGERS,
         MAX_APPEAL_WINDOW_LEDGERS, MAX_QUEUE_SIZE,
     },
 };
 
-fn setup(env: &Env) -> (ReputationContractClient<'_>, Address) {
+fn setup_with_id(env: &Env) -> (ReputationContractClient<'_>, Address, Address) {
     let contract_id = env.register_contract(None, ReputationContract);
     let client = ReputationContractClient::new(env, &contract_id);
     let admin = Address::generate(env);
     client.initialize(&admin);
+    (client, admin, contract_id)
+}
+
+fn setup(env: &Env) -> (ReputationContractClient<'_>, Address) {
+    let (client, admin, _contract_id) = setup_with_id(env);
     (client, admin)
+}
+
+fn ttl_of(env: &Env, contract_id: &Address, key: &DataKey) -> u32 {
+    env.as_contract(contract_id, || env.storage().persistent().get_ttl(key))
 }
 
 fn make_bytes(env: &Env, s: &str) -> Bytes {
@@ -1178,6 +1187,90 @@ fn test_queue_cap_rejects_new_reports() {
         &make_string(&env, "s"),
     );
     assert_eq!(result, Err(Ok(ReputationError::QueueFull)));
+}
+
+// ── Retention for active moderation (#054) ──────────────────────────────────
+
+#[test]
+fn test_report_and_moderation_refresh_review_retention() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, contract_id) = setup_with_id(&env);
+
+    let artist = Address::generate(&env);
+    let reviewer = Address::generate(&env);
+    let reporter = Address::generate(&env);
+    let review_id = make_bytes(&env, "ttl-review");
+    let review_key = DataKey::Review(review_id.clone());
+
+    client.submit_review(&review_id, &artist, &reviewer, &40u32, &make_string(&env, "ok"));
+    assert!(ttl_of(&env, &contract_id, &review_key) >= crate::REPUTATION_TTL_LEDGERS);
+
+    // A report rewrites the review; its retention must not fall back to the
+    // host default while moderation is still open.
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+    client.report_review(&review_id, &reporter, &ReportReason::Spam, &make_string(&env, "s"));
+    assert!(ttl_of(&env, &contract_id, &review_key) >= crate::REPUTATION_TTL_LEDGERS);
+    assert!(
+        ttl_of(&env, &contract_id, &DataKey::Report(review_id.clone(), 0))
+            >= crate::REPUTATION_TTL_LEDGERS
+    );
+
+    // Moderation rewrites the review again and records the decision.
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+    assert!(ttl_of(&env, &contract_id, &review_key) >= crate::REPUTATION_TTL_LEDGERS);
+    assert!(
+        ttl_of(&env, &contract_id, &DataKey::ModerationEntry(review_id.clone(), 0))
+            >= crate::REPUTATION_TTL_LEDGERS
+    );
+}
+
+#[test]
+fn test_filing_and_escalating_an_appeal_refreshes_retention() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, contract_id) = setup_with_id(&env);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "ttl-appeal");
+    let review_key = DataKey::Review(review_id.clone());
+    let appeal_key = DataKey::Appeal(review_id.clone());
+
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+    client.file_appeal(&review_id, &artist, &make_string(&env, "unfair"));
+    assert!(ttl_of(&env, &contract_id, &review_key) >= crate::REPUTATION_TTL_LEDGERS);
+    assert!(ttl_of(&env, &contract_id, &appeal_key) >= crate::REPUTATION_TTL_LEDGERS);
+
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+    client.escalate_appeal(&review_id, &artist);
+    assert!(ttl_of(&env, &contract_id, &appeal_key) >= crate::REPUTATION_TTL_LEDGERS);
+}
+
+#[test]
+fn test_resolving_an_appeal_refreshes_retention() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, contract_id) = setup_with_id(&env);
+
+    let artist = Address::generate(&env);
+    let review_id = make_bytes(&env, "ttl-resolve");
+    let review_key = DataKey::Review(review_id.clone());
+    let appeal_key = DataKey::Appeal(review_id.clone());
+
+    client.submit_review(&review_id, &artist, &Address::generate(&env), &30u32, &make_string(&env, "ok"));
+    client.report_review(&review_id, &Address::generate(&env), &ReportReason::Spam, &make_string(&env, "s"));
+    client.moderate_review(&review_id, &ReviewStatus::Removed, &make_string(&env, "removed"));
+    client.file_appeal(&review_id, &artist, &make_string(&env, "unfair"));
+
+    env.ledger().with_mut(|l| l.sequence_number += 100);
+    client.resolve_appeal(&review_id, &AppealStatus::Upheld);
+    assert!(ttl_of(&env, &contract_id, &appeal_key) >= crate::REPUTATION_TTL_LEDGERS);
+    assert!(ttl_of(&env, &contract_id, &review_key) >= crate::REPUTATION_TTL_LEDGERS);
 }
 
 // ── Error-code stability ────────────────────────────────────────────────────
