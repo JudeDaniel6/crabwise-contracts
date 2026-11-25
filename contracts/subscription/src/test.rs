@@ -435,6 +435,46 @@ fn unknown_accounts_and_tiers_are_reported() {
     );
 }
 
+// ── Issue #61: Reject subscription plans with invalid prices ────────────────
+
+#[test]
+fn invalid_plan_prices_are_rejected_and_do_not_replace_existing_tier() {
+    let f = setup();
+    let name = String::from_str(&f.env, "Invalid");
+
+    // Zero price must be rejected.
+    let err = f
+        .client
+        .try_create_tier(&99, &name, &0, &PERIOD, &Vec::new(&f.env))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SubscriptionError::InvalidPrice);
+
+    // Negative price must also be rejected.
+    let err = f
+        .client
+        .try_create_tier(&99, &name, &-1, &PERIOD, &Vec::new(&f.env))
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, SubscriptionError::InvalidPrice);
+
+    // No tier should have been created by either invalid attempt.
+    let err = f.client.try_get_tier(&99).err().unwrap().unwrap();
+    assert_eq!(err, SubscriptionError::TierNotFound);
+
+    // A valid price must succeed.
+    f.client.create_tier(
+        &99,
+        &name,
+        &1,
+        &PERIOD,
+        &Vec::new(&f.env),
+    );
+    assert_eq!(f.client.get_tier(&99).price, 1);
+}
+
 #[test]
 fn only_the_admin_manages_tiers() {
     let f = setup();
