@@ -787,6 +787,46 @@ mod test {
         assert!(result.is_err());
     }
 
+    // ── Issue #59: Return explicit errors for missing conversations ───────────
+
+    #[test]
+    fn test_missing_conversation_returns_explicit_error() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, MessagingContract);
+        let client = MessagingContractClient::new(&env, &contract_id);
+
+        let admin = Address::generate(&env);
+        let alice = Address::generate(&env);
+
+        client.initialize(&admin);
+
+        let missing_id = soroban_sdk::Bytes::from_slice(&env, b"conv-does-not-exist");
+
+        // get_conversation on a missing ID returns ConversationNotFound, not an empty message list.
+        let err = client
+            .try_get_conversation(&missing_id)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, MessagingError::ConversationNotFound);
+
+        // get_messages on a missing conversation also returns ConversationNotFound.
+        let err = client
+            .try_get_messages(&missing_id, &alice, &1, &10)
+            .err()
+            .unwrap()
+            .unwrap();
+        assert_eq!(err, MessagingError::ConversationNotFound);
+
+        // A real conversation with no messages returns an empty list, not an error.
+        let bob = Address::generate(&env);
+        let real_id = soroban_sdk::Bytes::from_slice(&env, b"conv-real");
+        client.create_conversation(&real_id, &alice, &bob);
+        let msgs = client.get_messages(&real_id, &alice, &1, &10);
+        assert_eq!(msgs.len(), 0);
+    }
+
     #[test]
     fn test_get_version_after_initialize() {
         let env = Env::default();
